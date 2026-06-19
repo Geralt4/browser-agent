@@ -1,0 +1,406 @@
+// Side panel logic for Browser Agent.
+// - Tabs: Chat + Settings
+// - Settings: API key via native host (OS keychain) with chrome.storage.local fallback
+// - Chat: task submission + SSE streaming + gate modal
+// - Vision nudge: shown when the selected model is not in the vision models list
+
+const API_BASE = "http://127.0.0.1:8000";
+const KEYRING_SERVICE = "browser-agent";
+
+// State
+let nativeAvailable = null; // null = unchecked, true/false after ping
+let currentTaskId = null;
+let eventSource = null;
+let currentGateId = null;
+let savedConfig = null; // last-loaded config from storage
+
+// ---------------- DOM helpers ----------------
+const $ = (id) => document.getElementById(id);
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ---------------- tabs ----------------
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const target = btn.dataset.tab;
+    document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tab-pane").forEach((p) => p.classList.toggle("active", p.id === `tab-${target}`));
+  });
+});
+
+// ---------------- native host bridge ----------------
+async function nativeCall(payload) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ kind: "native", payload }, (resp) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!resp || !resp.ok) {
+        reject(new Error((resp && resp.error) || "native call failed"));
+        return;
+      }
+      resolve(resp.response);
+    });
+  });
+}
+
+async function checkNative() {
+  try {
+    const resp = await nativeCall({ cmd: "ping" });
+    nativeAvailable = resp && resp.ok === true;
+  } catch {
+    nativeAvailable = false;
+  }
+  return nativeAvailable;
+}
+
+// ---------------- storage ----------------
+async function loadSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(
+      ["provider", "baseUrl", "model", "visionMode", "visionModels"],
+      (sync) => {
+        chrome.storage.local.get(["apiKey", "usingLocalFallback"], (local) => {
+          resolve({
+            provider: sync.provider || "openai",
+            baseUrl: sync.baseUrl || "",
+            model: sync.model || "",
+            visionMode: sync.visionMode || "auto",
+            visionModels: sync.visionModels || "",
+            apiKey: local.apiKey || "",
+            usingLocalFallback: !!local.usingLocalFallback,
+          });
+        });
+      }
+    );
+  });
+}
+
+async function saveSettings(s) {
+  await new Promise((resolve) =>
+    chrome.storage.sync.set(
+      {
+        provider: s.provider,
+        baseUrl: s.baseUrl,
+        model: s.model,
+        visionMode: s.visionMode,
+        visionModels: s.visionModels,
+      },
+      resolve
+    )
+  );
+  await new Promise((resolve) =>
+    chrome.storage.local.set(
+      { apiKey: s.apiKey, usingLocalFallback: !!s.usingLocalFallback },
+      resolve
+    )
+  );
+}
+
+async function storeApiKey(key) {
+  if (!key) {
+    if (nativeAvailable) {
+      try { await nativeCall({ cmd: "delete_key", service: KEYRING_SERVICE, key: "llm_api_key" }); }
+      catch {}
+    }
+    await new Promise((r) => chrome.storage.local.remove("apiKey", r));
+    return;
+  }
+  if (nativeAvailable) {
+    try {
+      await nativeCall({ cmd: "set_key", service: KEYRING_SERVICE, key: "llm_api_key", value: key });
+      await new Promise((r) => chrome.storage.local.remove(["apiKey", "usingLocalFallback"], r));
+      return;
+    } catch (e) {
+      // fall through to local fallback
+    }
+  }
+  // local fallback (less secure, but functional)
+  await new Promise((r) =>
+    chrome.storage.local.set({ apiKey: key, usingLocalFallback: true }, r)
+  );
+}
+
+async function loadApiKey() {
+  if (nativeAvailable) {
+    try {
+      const resp = await nativeCall({ cmd: "get_key", service: KEYRING_SERVICE, key: "llm_api_key" });
+      if (resp && resp.ok && resp.value) return { key: resp.value, fromLocal: false };
+    } catch {}
+  }
+  const local = await new Promise((r) => chrome.storage.local.get("apiKey", r));
+  return { key: local.apiKey || "", fromLocal: !!local.apiKey };
+}
+
+// ---------------- settings form ----------------
+function fillSettings(s) {
+  $("provider").value = s.provider;
+  $("base-url").value = s.baseUrl;
+  $("model").value = s.model;
+  $("vision-mode").value = s.visionMode;
+  $("vision-models").value = s.visionModels;
+  $("api-key").value = s.apiKey || ""; // pre-fill if stored locally
+  updateVisionNudge();
+}
+
+function readSettings() {
+  return {
+    provider: $("provider").value,
+    baseUrl: $("base-url").value.trim(),
+    model: $("model").value.trim(),
+    visionMode: $("vision-mode").value,
+    visionModels: $("vision-models").value.trim(),
+    apiKey: $("api-key").value,
+  };
+}
+
+function updateVisionNudge() {
+  const model = $("model").value.trim().toLowerCase();
+  const visionModels = $("vision-models").value.toLowerCase()
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  const nudge = $("vision-nudge");
+  if (model && visionModels.length > 0 && !visionModels.includes(model)) {
+    nudge.classList.remove("hidden");
+  } else {
+    nudge.classList.add("hidden");
+  }
+}
+
+$("model").addEventListener("change", updateVisionNudge);
+$("vision-models").addEventListener("input", updateVisionNudge);
+
+$("toggle-key").addEventListener("click", () => {
+  const inp = $("api-key");
+  if (inp.type === "password") { inp.type = "text"; $("toggle-key").textContent = "Hide"; }
+  else                          { inp.type = "password"; $("toggle-key").textContent = "Show"; }
+});
+
+$("fetch-models").addEventListener("click", async () => {
+  const s = readSettings();
+  if (!s.baseUrl) { setStatus("models-status", "Set API Base URL first.", "error"); return; }
+  if (!s.apiKey)  { setStatus("models-status", "Set API Key first.", "error"); return; }
+  setStatus("models-status", "Fetching…");
+  $("fetch-models").disabled = true;
+  try {
+    const params = new URLSearchParams({ base_url: s.baseUrl, api_key: s.apiKey });
+    const r = await fetch(`${API_BASE}/api/models?${params}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    populateModels(data.models || [], s.model);
+    setStatus("models-status", `Loaded ${data.models.length} models.`, "ok");
+  } catch (e) {
+    setStatus("models-status", `Failed: ${e.message}`, "error");
+  } finally {
+    $("fetch-models").disabled = false;
+  }
+});
+
+function populateModels(models, selected) {
+  const sel = $("model");
+  sel.innerHTML = "";
+  if (!models.length) {
+    sel.innerHTML = '<option value="">— no models found —</option>';
+    sel.disabled = true;
+    return;
+  }
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m; opt.textContent = m;
+    if (m === selected) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.disabled = false;
+  updateVisionNudge();
+}
+
+$("settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const s = readSettings();
+  const status = $("save-status");
+  status.textContent = "Saving…";
+  status.className = "save-status";
+  try {
+    await storeApiKey(s.apiKey);
+    const persist = { ...s, apiKey: "" };
+    await saveSettings(persist);
+    savedConfig = { ...persist, apiKey: s.apiKey };
+    status.textContent = "Saved.";
+    status.className = "save-status ok";
+  } catch (err) {
+    status.textContent = `Save failed: ${err.message}`;
+    status.className = "save-status error";
+  }
+  setTimeout(() => { status.textContent = ""; status.className = "save-status"; }, 2500);
+});
+
+function setStatus(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "hint " + (cls || "");
+}
+
+// ---------------- chat tab ----------------
+function appendMsg(cls, html) {
+  const div = document.createElement("div");
+  div.className = "msg " + cls;
+  div.innerHTML = html;
+  $("stream").appendChild(div);
+  $("stream").scrollTop = $("stream").scrollHeight;
+  return div;
+}
+
+$("send-btn").addEventListener("click", sendTask);
+$("task-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendTask(); }
+});
+
+async function sendTask() {
+  const task = $("task-input").value.trim();
+  if (!task) return;
+  if (!savedConfig || !savedConfig.model) {
+    appendMsg("msg--error", "Pick a model in Settings first.");
+    document.querySelector('.tab[data-tab="settings"]').click();
+    return;
+  }
+  if (!savedConfig.apiKey) {
+    appendMsg("msg--error", "Set an API key in Settings first.");
+    document.querySelector('.tab[data-tab="settings"]').click();
+    return;
+  }
+
+  $("task-input").disabled = true;
+  $("send-btn").disabled = true;
+  $("stream").innerHTML = "";
+  appendMsg("msg--system", 'Submitting task… <span class="spinner"></span>');
+  if (eventSource) eventSource.close();
+
+  try {
+    const r = await fetch(`${API_BASE}/api/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task,
+        provider: savedConfig.provider,
+        base_url: savedConfig.baseUrl || null,
+        model: savedConfig.model,
+        api_key: savedConfig.apiKey,
+        vision_mode: savedConfig.visionMode,
+        vision_models: savedConfig.visionModels || null,
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    currentTaskId = data.task_id;
+    openStream();
+  } catch (e) {
+    appendMsg("msg--error", `Failed: ${e.message}`);
+    resetChatUI();
+  }
+}
+
+function openStream() {
+  if (!currentTaskId) return;
+  eventSource = new EventSource(`${API_BASE}/api/task/${currentTaskId}/stream`);
+  eventSource.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    handleStreamEvent(msg);
+  };
+  eventSource.onerror = () => {
+    appendMsg("msg--error", "Connection lost");
+    resetChatUI();
+  };
+}
+
+function handleStreamEvent(msg) {
+  if (msg.type === "start") {
+    $("stream").innerHTML = "";
+    appendMsg("msg--system", esc(msg.message));
+  } else if (msg.type === "system" || msg.type === "nudge") {
+    appendMsg("msg--nudge", esc(msg.message));
+  } else if (msg.type === "step") {
+    let html = '<div class="step-header"><span class="step-badge">Step ' + msg.step_n + '</span>';
+    if (msg.next_subgoal) html += '<span class="step-label">Next: ' + esc(msg.next_subgoal) + '</span>';
+    html += '</div>';
+    if (msg.assessment) html += '<div class="step-field"><strong>Assessment:</strong> ' + esc(msg.assessment) + '</div>';
+    if (msg.memory)     html += '<div class="step-field"><strong>Memory:</strong> ' + esc(msg.memory) + '</div>';
+    if (msg.action)     html += '<div class="step-field"><strong>Action:</strong> <code>' + esc(msg.action) + '</code></div>';
+    appendMsg("msg--step", html);
+  } else if (msg.type === "gate") {
+    currentGateId = msg.gate_id;
+    let details = '<dt>Action</dt><dd>' + esc(msg.name) + '</dd>';
+    if (msg.summary) details += '<dt>Details</dt><dd>' + esc(msg.summary) + '</dd>';
+    for (const k in msg.params) {
+      if (k !== "index" && k !== "new_tab") details += '<dt>' + esc(k) + '</dt><dd>' + esc(String(msg.params[k])) + '</dd>';
+    }
+    $("gate-detail").innerHTML = details;
+    $("gate-overlay").classList.add("open");
+  } else if (msg.type === "done") {
+    appendMsg("msg--done", "<strong>Done:</strong> " + esc(msg.result));
+    resetChatUI();
+  } else if (msg.type === "error") {
+    appendMsg("msg--error", "Error: " + esc(msg.message));
+    resetChatUI();
+  }
+}
+
+function resetChatUI() {
+  $("task-input").disabled = false;
+  $("send-btn").disabled = false;
+  $("task-input").focus();
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  currentTaskId = null;
+}
+
+$("gate-approve").addEventListener("click", () => resolveGate(true));
+$("gate-deny").addEventListener("click", () => resolveGate(false));
+function resolveGate(approved) {
+  if (!currentGateId) return;
+  fetch(`${API_BASE}/api/gate/${approved ? "approve" : "deny"}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ gate_id: currentGateId }),
+  });
+  $("gate-overlay").classList.remove("open");
+  currentGateId = null;
+}
+
+// ---------------- init ----------------
+async function init() {
+  await checkNative();
+  savedConfig = await loadSettings();
+
+  // If the saved config has no model, try to pre-fill the API key from the
+  // native host (the user may have entered it before but it's only in the
+  // OS keychain, not in chrome.storage.local).
+  if (nativeAvailable && !savedConfig.apiKey) {
+    const k = await loadApiKey();
+    if (k.key) {
+      savedConfig.apiKey = k.key;
+      $("api-key").value = k.key;
+    }
+  }
+
+  fillSettings(savedConfig);
+
+  if (!nativeAvailable) {
+    $("storage-warning").classList.remove("hidden");
+    $("api-key-hint").textContent =
+      "Native host unavailable. API key will be stored in chrome.storage.local (less secure).";
+  } else {
+    $("api-key-hint").textContent =
+      "Stored in your OS keychain via the native messaging host.";
+  }
+
+  // Probe backend reachability
+  try {
+    const r = await fetch(`${API_BASE}/api/config`, { method: "GET" });
+    if (!r.ok) throw new Error();
+  } catch {
+    $("connection-warning").classList.remove("hidden");
+  }
+}
+
+init();

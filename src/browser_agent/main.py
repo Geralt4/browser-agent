@@ -18,7 +18,8 @@ def main() -> None:
     task = " ".join(args)
     cfg = load_config()
     adapter = get_adapter(cfg)
-    safety = SafetyLayer(cfg)
+    chat_model = adapter.chat_model() if cfg.sensitivity_llm else None
+    safety = SafetyLayer(cfg, chat_model=chat_model)
 
     print(f"[browser-agent] provider={cfg.provider} model={adapter.name} task={task!r}")
     history = asyncio.run(run_task(task, cfg=cfg, adapter=adapter, safety=safety))

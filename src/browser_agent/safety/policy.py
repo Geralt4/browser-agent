@@ -9,23 +9,34 @@ def host_of(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
 
 
+def _matches(pattern: str, host: str) -> bool:
+    """Match a host pattern against a hostname using suffix matching.
+
+    'example.com' matches 'example.com' and 'www.example.com'.
+    '.example.com' matches only subdomains of example.com.
+    """
+    if pattern.startswith("."):
+        return host.endswith(pattern) or host == pattern[1:]
+    return host == pattern or host.endswith("." + pattern)
+
+
 def check_navigation(
     url: str, allow_hosts: list[str], block_hosts: list[str]
 ) -> SafetyDecision | None:
     """Return a deny decision if navigation violates the lists, else None.
 
-    Stub policy: substring match on host. Phase 4 swaps in category-based
-    block lists (financial/adult/sensitive) by default.
+    Uses suffix-based domain matching: 'example.com' matches 'www.example.com'
+    but 'mail' does not match 'gmail.com'.
     """
     host = host_of(url)
     if not host:
         return SafetyDecision(allow=False, reason=f"could not parse host from {url!r}")
 
     for blocked in block_hosts:
-        if blocked in host:
+        if _matches(blocked, host):
             return SafetyDecision(allow=False, reason=f"host {host!r} is on the blocklist")
 
-    if allow_hosts and not any(allowed in host for allowed in allow_hosts):
+    if allow_hosts and not any(_matches(allowed, host) for allowed in allow_hosts):
         return SafetyDecision(allow=False, reason=f"host {host!r} is not on the allowlist")
 
     return None

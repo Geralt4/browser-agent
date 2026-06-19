@@ -1,23 +1,35 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from browser_agent.config import Config
-from browser_agent.safety.classifier import is_sensitive
+from browser_agent.safety.classifier import classify_sensitive_llm, is_sensitive
 from browser_agent.safety.gate import ConfirmationGate
 from browser_agent.safety.policy import check_navigation
 from browser_agent.safety.types import PendingAction, SafetyDecision
+
+if TYPE_CHECKING:
+    from browser_use.llm.base import BaseChatModel
 
 
 class SafetyLayer:
     """Single choke point every tool routes through before acting.
 
     Order: kill switch -> site policy -> sensitivity -> confirmation gate.
-    Phase 4 fills in the injection filter and category block lists; the seam is
-    here so nothing downstream changes when it does.
+    When an optional LLM is provided and SENSITIVITY_LLM is enabled, the
+    keyword heuristic runs first; only if it returns False does the LLM
+    fallback fire (cost-conscious).
     """
 
-    def __init__(self, cfg: Config, gate: ConfirmationGate | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        gate: ConfirmationGate | None = None,
+        chat_model: BaseChatModel | None = None,
+    ) -> None:
         self._cfg = cfg
         self._gate = gate or ConfirmationGate()
+        self._chat_model = chat_model
 
     async def guard(self, action: PendingAction) -> SafetyDecision:
         if self._cfg.kill_switch:
@@ -33,6 +45,13 @@ class SafetyLayer:
                 return verdict
 
         if is_sensitive(action):
+            return await self._gate.confirm(action)
+
+        if (
+            self._cfg.sensitivity_llm
+            and self._chat_model is not None
+            and await classify_sensitive_llm(action, self._chat_model)
+        ):
             return await self._gate.confirm(action)
 
         return SafetyDecision(allow=True, reason="not sensitive")

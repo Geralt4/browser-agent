@@ -14,8 +14,6 @@ class GenericOpenAIAdapter(ModelAdapter):
     moving to Kimi is just a provider/config change.
     """
 
-    supports_vision = False
-
     def __init__(self, cfg: Config) -> None:
         if not cfg.llm_model:
             raise ValueError("LLM_MODEL is not set for the 'openai' provider.")
@@ -23,6 +21,13 @@ class GenericOpenAIAdapter(ModelAdapter):
             raise ValueError("LLM_API_KEY is not set for the 'openai' provider.")
         self._cfg = cfg
         self.name = cfg.llm_model
+
+    @property
+    def supports_vision(self) -> bool:
+        if self._cfg.vision_models:
+            known = [m.strip().lower() for m in self._cfg.vision_models.split(",") if m.strip()]
+            return self.name.lower() in known
+        return False
 
     def chat_model(self) -> BaseChatModel:
         return ChatOpenAI(

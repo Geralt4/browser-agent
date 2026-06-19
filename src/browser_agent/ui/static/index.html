@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Browser Agent</title>
+  <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --surface: #16213e;
+      --border: #2a2a4a;
+      --text: #e0e0e0;
+      --muted: #888;
+      --accent: #4fc3f7;
+      --danger: #ef5350;
+      --success: #66bb6a;
+      --warning: #ffa726;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    header {
+      text-align: center;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 12px;
+    }
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+    #stream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #input-area {
+      display: flex;
+      gap: 8px;
+      padding: 12px 0;
+      border-top: 1px solid var(--border);
+    }
+    #task-input {
+      flex: 1;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.95rem;
+      resize: none;
+      min-height: 44px;
+      font-family: inherit;
+    }
+    #task-input:focus { outline: none; border-color: var(--accent); }
+    #task-input:disabled { opacity: 0.5; }
+    button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: opacity 0.15s;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #send-btn { background: var(--accent); color: #111; }
+    #send-btn:hover:not(:disabled) { opacity: 0.85; }
+
+    .msg {
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+      line-height: 1.5;
+      animation: fadeIn 0.2s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } }
+    .msg--system { color: var(--muted); font-style: italic; }
+    .msg--step { }
+    .msg--error { border-color: var(--danger); color: var(--danger); }
+    .msg--done { border-color: var(--success); }
+
+    .step-header {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .step-badge {
+      background: var(--accent);
+      color: #111;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 99px;
+    }
+    .step-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
+    .step-field { margin: 4px 0; }
+    .step-field strong { color: var(--muted); font-size: 0.75rem; }
+
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- gate modal ---- */
+    .overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 100;
+    }
+    .overlay.open { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 440px;
+      width: 90%;
+    }
+    .modal h2 { font-size: 1rem; margin-bottom: 12px; color: var(--warning); }
+    .modal .action-detail {
+      background: var(--bg);
+      padding: 12px;
+      border-radius: var(--radius);
+      margin-bottom: 16px;
+      font-family: monospace;
+      font-size: 0.85rem;
+    }
+    .modal .action-detail dt { color: var(--muted); font-size: 0.7rem; text-transform: uppercase; margin-top: 6px; }
+    .modal .action-detail dd { margin-left: 0; word-break: break-all; }
+    .modal .actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .modal .btn-approve { background: var(--success); color: #111; min-width: 100px; }
+    .modal .btn-deny { background: var(--danger); color: #fff; min-width: 100px; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Browser Agent</h1>
+  </header>
+
+  <div id="stream">
+    <div class="msg msg--system">Enter a task to get started.</div>
+  </div>
+
+  <div id="input-area">
+    <textarea id="task-input"
+      placeholder="e.g. Go to example.com and return the H1 heading"
+      rows="2"></textarea>
+    <button id="send-btn" onclick="sendTask()">Send</button>
+  </div>
+
+  <!-- gate modal -->
+  <div id="gate-overlay" class="overlay">
+    <div class="modal">
+      <h2>Sensitive Action Requires Approval</h2>
+      <dl class="action-detail" id="gate-detail"></dl>
+      <div class="actions">
+        <button class="btn-deny" onclick="resolveGate(false)">Deny</button>
+        <button class="btn-approve" onclick="resolveGate(true)">Approve</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const stream = document.getElementById('stream');
+    const input = document.getElementById('task-input');
+    const btn = document.getElementById('send-btn');
+    const overlay = document.getElementById('gate-overlay');
+    const gateDetail = document.getElementById('gate-detail');
+    let eventSource = null;
+    let currentGateId = null;
+
+    function appendMsg(cls, html) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + cls;
+      div.innerHTML = html;
+      stream.appendChild(div);
+      stream.scrollTop = stream.scrollHeight;
+    }
+
+    function sendTask() {
+      const task = input.value.trim();
+      if (!task) return;
+      input.disabled = true;
+      btn.disabled = true;
+      stream.innerHTML = '';
+      appendMsg('msg--system', 'Submitting task&hellip; <span class="spinner" style="vertical-align:middle"></span>');
+      if (eventSource) eventSource.close();
+
+      fetch('/api/task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task })
+      })
+      .then(r => r.json())
+      .then(data => {
+        eventSource = new EventSource('/api/task/' + data.task_id + '/stream');
+        eventSource.onmessage = function(e) {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'start') {
+            stream.innerHTML = '';
+            appendMsg('msg--system', msg.message);
+          } else if (msg.type === 'step') {
+            let html = '<div class="step-header"><span class="step-badge">Step ' + msg.step_n + '</span>';
+            if (msg.next_subgoal) html += '<span class="step-label">Next: ' + esc(msg.next_subgoal) + '</span>';
+            html += '</div>';
+            if (msg.assessment) html += '<div class="step-field"><strong>Assessment:</strong> ' + esc(msg.assessment) + '</div>';
+            if (msg.memory) html += '<div class="step-field"><strong>Memory:</strong> ' + esc(msg.memory) + '</div>';
+            if (msg.action) html += '<div class="step-field"><strong>Action:</strong> <code>' + esc(msg.action) + '</code></div>';
+            appendMsg('msg--step', html);
+          } else if (msg.type === 'gate') {
+            currentGateId = msg.gate_id;
+            let details = '<dt>Action</dt><dd>' + esc(msg.name) + '</dd>';
+            var summaryText = msg.summary || '';
+            if (summaryText) details += '<dt>Details</dt><dd>' + esc(summaryText) + '</dd>';
+            for (var k in msg.params) {
+              if (k !== 'index' && k !== 'new_tab') details += '<dt>' + esc(k) + '</dt><dd>' + esc(String(msg.params[k])) + '</dd>';
+            }
+            gateDetail.innerHTML = details;
+            overlay.classList.add('open');
+          } else if (msg.type === 'done') {
+            appendMsg('msg--done', '<strong>Done:</strong> ' + esc(msg.result));
+            resetUI();
+          } else if (msg.type === 'error') {
+            appendMsg('msg--error', 'Error: ' + esc(msg.message));
+            resetUI();
+          }
+        };
+        eventSource.onerror = function() {
+          appendMsg('msg--error', 'Connection lost');
+          resetUI();
+        };
+      })
+      .catch(function(err) {
+        appendMsg('msg--error', 'Failed to start task: ' + err.message);
+        resetUI();
+      });
+    }
+
+    function resolveGate(approved) {
+      fetch('/api/gate/' + (approved ? 'approve' : 'deny'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gate_id: currentGateId })
+      }).then(function() {
+        overlay.classList.remove('open');
+        currentGateId = null;
+      });
+    }
+
+    function resetUI() {
+      input.disabled = false;
+      btn.disabled = false;
+      input.focus();
+    }
+
+    function esc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendTask(); }
+    });
+  </script>
+
+</body>
+</html>

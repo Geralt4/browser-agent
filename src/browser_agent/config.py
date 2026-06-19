@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +33,20 @@ class Config(BaseSettings):
     headless: bool = True
     max_steps: int = 25
 
+    # Vision routing: "dom" = always DOM-only, "auto" = per-task heuristic,
+    # "vision" = always use vision (if model supports it).
+    vision_mode: str = "auto"
+
+    # User-configured comma-separated list of vision-capable model names.
+    # GenericOpenAIAdapter treats the model as vision-capable iff its name
+    # appears (case-insensitive) in this list. We don't auto-detect — the
+    # user knows their provider's model capabilities best.
+    vision_models: str | None = None
+
+    # Safety: LLM-based sensitivity classifier as fallback when the keyword
+    # heuristic returns False. Off by default (cost); enable for production.
+    sensitivity_llm: bool = False
+
     # Safety policy (comma-separated host substrings)
     allowlist: str | None = None
     blocklist: str | None = None
@@ -43,6 +59,17 @@ class Config(BaseSettings):
     @property
     def block_hosts(self) -> list[str]:
         return _csv(self.blocklist)
+
+    def with_overrides(self, **kwargs: Any) -> Config:
+        """Return a new Config with the given fields overridden.
+
+        Use this for per-request overrides from the UI / Chrome extension
+        without mutating the process-wide .env-loaded config. Only fields
+        that are actually present in the override and non-None are applied
+        (None values are treated as "don't override").
+        """
+        updates = {k: v for k, v in kwargs.items() if v is not None and k in type(self).model_fields}
+        return self.model_copy(update=updates)
 
 
 def load_config() -> Config:

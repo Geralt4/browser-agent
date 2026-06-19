@@ -1,0 +1,9 @@
+{
+  "name": "com.browseragent.native_host",
+  "description": "Browser Agent native messaging host (OS keychain bridge for API keys)",
+  "path": "REPLACE_WITH_ABSOLUTE_PATH_TO_NATIVE_HOST/native_host.py",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
+  ]
+}

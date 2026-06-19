@@ -114,4 +114,25 @@ def build_tools(safety: SafetyLayer) -> Tools:
         await event.event_result(raise_if_any=True, raise_if_none=False)
         return ActionResult(extracted_content=f"scrolled {direction} {amount}px")
 
+    @tools.action("Extract information from the current page based on a query")
+    async def extract(query: str, browser_session: BrowserSession) -> ActionResult:
+        decision = await safety.guard(
+            PendingAction(name="extract", params={"query": query})
+        )
+        if not decision.allow:
+            return _blocked(decision.reason)
+        state = await browser_session.get_browser_state_summary(include_screenshot=False)
+        dom_text = state.dom_state.llm_representation() if state.dom_state else ""
+        return ActionResult(
+            extracted_content=f"DOM content for extraction query '{query}':\n{dom_text[:8000]}",
+            include_in_memory=True,
+        )
+
+    @tools.action("Signal that the task is complete and return the final result to the user")
+    async def done(result: str, browser_session: BrowserSession) -> ActionResult:
+        return ActionResult(
+            extracted_content=result,
+            is_done=True,
+        )
+
     return tools
