@@ -69,6 +69,12 @@ class StreamingConfirmationGate(ConfirmationGate):
         except TimeoutError:
             self._events.pop(gate_id, None)
             return SafetyDecision(allow=False, reason="gate timed out — denied by default")
+        except asyncio.CancelledError:
+            # The streaming task was cancelled (client disconnect, orphan
+            # cleanup) while waiting for approval. Drop the entry so it can't
+            # leak; a late resolve() would otherwise no-op on a dead task.
+            self._events.pop(gate_id, None)
+            raise
 
         _, allowed = self._events.pop(gate_id, (None, False))
         if allowed:

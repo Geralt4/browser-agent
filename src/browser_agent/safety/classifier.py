@@ -50,7 +50,13 @@ Reply with a single word: YES (sensitive) or NO (harmless)."""
 
 
 def is_sensitive(action: PendingAction) -> bool:
-    """Heuristic stub. Phase 4 replaces this with the full classifier."""
+    """Keyword heuristic: matches sensitive intents + personal data in fields.
+
+    This is the cheap first pass. When it returns False and SENSITIVITY_LLM is
+    on, `classify_sensitive_llm()` runs as a fallback. Keep the keyword list
+    and the personal-data regexes in sync with the brief's sensitive categories
+    (send, publish, purchase, delete, submit, account-state changes, PII).
+    """
     blob = " ".join(str(v) for v in action.params.values()).lower()
     if any(kw in blob for kw in SENSITIVE_KEYWORDS):
         return True
@@ -73,10 +79,10 @@ async def classify_sensitive_llm(
     the model flags the action as sensitive, False if harmless, or None on
     model error (caller should treat as "not sensitive" — default-allow).
     """
-    from browser_use.llm.messages import UserMessage
+    from browser_use.llm.messages import BaseMessage, UserMessage
 
     prompt = _SENSITIVITY_PROMPT.format(action=action.summary())
-    messages = [UserMessage(content=prompt)]
+    messages: list[BaseMessage] = [UserMessage(content=prompt)]
 
     try:
         result = await chat_model.ainvoke(messages)
@@ -93,8 +99,10 @@ def _extract_text(result: object) -> str | None:
     """Extract text from a ChatOpenAI ainvoke result, which may be wrapped."""
     if isinstance(result, str):
         return result
-    if hasattr(result, "content"):
-        return str(result.content)
-    if hasattr(result, "completion"):
-        return str(result.completion)
+    content = getattr(result, "content", None)
+    if content is not None:
+        return str(content)
+    completion = getattr(result, "completion", None)
+    if completion is not None:
+        return str(completion)
     return str(result)

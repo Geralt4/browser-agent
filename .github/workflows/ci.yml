@@ -22,5 +22,8 @@ jobs:
       - name: Lint
         run: uv run ruff check .
 
+      - name: Type check
+        run: npx --yes pyright@1.1.410
+
       - name: Test
         run: uv run pytest

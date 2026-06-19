@@ -30,6 +30,9 @@ class GenericOpenAIAdapter(ModelAdapter):
         return False
 
     def chat_model(self) -> BaseChatModel:
+        # __init__ already raised if llm_model is None, but pyright can't see
+        # that across the method boundary, so narrow explicitly.
+        assert self._cfg.llm_model is not None
         return ChatOpenAI(
             model=self._cfg.llm_model,
             base_url=self._cfg.llm_base_url,  # None -> api.openai.com

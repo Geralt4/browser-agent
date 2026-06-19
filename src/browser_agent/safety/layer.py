@@ -31,6 +31,16 @@ class SafetyLayer:
         self._gate = gate or ConfirmationGate()
         self._chat_model = chat_model
 
+    @property
+    def gate(self) -> ConfirmationGate:
+        """The confirmation gate this layer consults for sensitive actions.
+
+        Read-only access for callers that need to wire the gate to a transport
+        (e.g. the streaming loop sets the gate's queue). Mutating the gate's
+        own state is the caller's responsibility.
+        """
+        return self._gate
+
     async def guard(self, action: PendingAction) -> SafetyDecision:
         if self._cfg.kill_switch:
             return SafetyDecision(allow=False, reason="kill switch engaged")

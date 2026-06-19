@@ -85,7 +85,7 @@ async def run_task_streaming(
     The caller is responsible for wiring a StreamingConfirmationGate into the safety
     layer before invoking. Set gate.set_queue(queue) to enable gate prompts.
     """
-    gate = safety._gate
+    gate = safety.gate
     if queue is not None and isinstance(gate, StreamingConfirmationGate):
         gate.set_queue(queue)
 

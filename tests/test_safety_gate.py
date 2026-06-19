@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from browser_agent.config import Config
 from browser_agent.safety.gate import ConfirmationGate
 from browser_agent.safety.layer import SafetyLayer
@@ -53,3 +55,22 @@ def test_blocklist_blocks_navigation():
         layer.guard(PendingAction(name="navigate", params={"url": "https://www.evil.com/x"}))
     )
     assert decision.allow is False
+
+
+def test_streaming_gate_cleans_up_on_cancel():
+    """A cancelled confirm() must not leave an entry in _events."""
+    from browser_agent.safety.gate import StreamingConfirmationGate
+
+    gate = StreamingConfirmationGate()
+    action = PendingAction(name="click", params={"index": 1, "element_text": "Delete"})
+
+    async def run():
+        task = asyncio.create_task(gate.confirm(action))
+        await asyncio.sleep(0.01)  # let it register the entry
+        assert len(gate._events) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(gate._events) == 0  # cleaned up, no leak
+
+    asyncio.run(run())

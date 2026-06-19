@@ -184,8 +184,10 @@ $("fetch-models").addEventListener("click", async () => {
   setStatus("models-status", "Fetching…");
   $("fetch-models").disabled = true;
   try {
-    const params = new URLSearchParams({ base_url: s.baseUrl, api_key: s.apiKey });
-    const r = await fetch(`${API_BASE}/api/models?${params}`);
+    const params = new URLSearchParams({ base_url: s.baseUrl });
+    const r = await fetch(`${API_BASE}/api/models?${params}`, {
+      headers: { "X-API-Key": s.apiKey },
+    });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     populateModels(data.models || [], s.model);

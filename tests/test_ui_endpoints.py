@@ -59,27 +59,32 @@ class TestGetConfig:
 
 class TestUpdateConfig:
     def test_persists_to_env(self, client, env_backup):
-        r = client.post("/api/config", json={"LLM_MODEL": "gpt-4o", "VISION_MODE": "vision"})
+        # Lowercase keys (what GET returns) round-trip to uppercase env vars.
+        r = client.post("/api/config", json={"llm_model": "gpt-4o", "vision_mode": "vision"})
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
 
-        # Read back from disk
         text = env_backup.read_text()
         assert "LLM_MODEL=gpt-4o" in text
         assert "VISION_MODE=vision" in text
 
+    def test_uppercase_keys_still_accepted(self, client, env_backup):
+        # Backward compatibility: uppercase env-var names keep working.
+        r = client.post("/api/config", json={"LLM_MODEL": "gpt-4o"})
+        assert r.status_code == 200
+        assert "LLM_MODEL=gpt-4o" in env_backup.read_text()
+
     def test_empty_value_clears(self, client, env_backup):
         env_backup.write_text("PROVIDER=openai\nLLM_MODEL=gpt-4o\nVISION_MODELS=llava\n")
-        r = client.post("/api/config", json={"LLM_MODEL": ""})
+        r = client.post("/api/config", json={"llm_model": ""})
         assert r.status_code == 200
         text = env_backup.read_text()
         assert "LLM_MODEL=" in text
-        # the empty value is set
         assert "LLM_MODEL=\n" in text
 
     def test_preserves_unrelated_keys(self, client, env_backup):
         env_backup.write_text("PROVIDER=openai\nLLM_API_KEY=secret\nHEADLESS=true\n")
-        r = client.post("/api/config", json={"LLM_MODEL": "gpt-4o"})
+        r = client.post("/api/config", json={"llm_model": "gpt-4o"})
         assert r.status_code == 200
         text = env_backup.read_text()
         assert "LLM_API_KEY=secret" in text

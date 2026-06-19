@@ -62,21 +62,41 @@ async def get_config():
     }
 
 
+# Lowercase JSON keys (what GET returns) -> uppercase env-var names on disk.
+# Keeping this explicit keeps the write side auditable.
+_CONFIG_KEYS: dict[str, str] = {
+    "llm_base_url": "LLM_BASE_URL",
+    "llm_model": "LLM_MODEL",
+    "vision_mode": "VISION_MODE",
+    "vision_models": "VISION_MODELS",
+}
+
+
 @app.post("/api/config")
 async def update_config(request: Request):
-    """Update the process-wide .env-loaded config.
+    """Persist safe config fields to .env (process-wide, survives restart).
 
-    Persists to .env so subsequent restarts pick it up. Accepts the same safe
-    fields as GET /api/config. Empty strings are treated as "clear".
+    Accepts the same lowercase keys GET /api/config returns. Empty strings are
+    treated as "clear". Uppercase keys are also accepted (deprecated) for
+    backward compatibility.
+
+    Scope: this is the *defaults* knob — it rewrites .env so later `load_config()`
+    calls (and restarts) pick it up. It does NOT mutate already-running tasks:
+    each /api/task builds an isolated Config via `with_overrides()` at submit
+    time, so in-flight tasks are unaffected by a config write mid-run. Per-task
+    overrides belong in the POST /api/task body, not here.
     """
     body = await request.json()
     env_path = _env_path()
     env_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_env(env_path)
-    for key in ("LLM_BASE_URL", "LLM_MODEL", "VISION_MODE", "VISION_MODELS"):
-        if key in body:
-            value = body[key]
-            existing[key] = "" if value is None else str(value)
+    for lower, env_key in _CONFIG_KEYS.items():
+        if lower in body:
+            value = body[lower]
+            existing[env_key] = "" if value is None else str(value)
+        elif env_key in body:
+            value = body[env_key]
+            existing[env_key] = "" if value is None else str(value)
     _write_env(env_path, existing)
     return {"status": "ok"}
 

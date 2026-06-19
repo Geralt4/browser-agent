@@ -43,3 +43,7 @@ typeCheckingMode = "basic"
 include = ["src"]
 exclude = ["tests", "benchmarks", "scripts", "extension"]
 pythonVersion = "3.11"
+# Resolve imports against the uv-managed venv. Without this, pyright can't see
+# browser_use / pydantic / fastapi and reports spurious missing-import errors.
+venvPath = "."
+venv = ".venv"
