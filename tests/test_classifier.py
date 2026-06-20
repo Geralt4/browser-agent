@@ -7,6 +7,25 @@ def test_benign_navigation_not_sensitive():
     assert is_sensitive(action) is False
 
 
+def test_navigate_url_with_post_keyword_not_sensitive():
+    """URLs containing 'post' in the path must not trigger the keyword
+    classifier — navigation is not a sensitive intent."""
+    action = PendingAction(
+        name="navigate",
+        params={"url": "https://httpbin.org/forms/post", "new_tab": False},
+    )
+    assert is_sensitive(action) is False
+
+
+def test_navigate_url_with_delete_keyword_not_sensitive():
+    """Same for 'delete' in a URL path."""
+    action = PendingAction(
+        name="navigate",
+        params={"url": "https://example.com/delete/account", "new_tab": False},
+    )
+    assert is_sensitive(action) is False
+
+
 def test_read_more_link_not_sensitive():
     action = PendingAction(name="click", params={"index": 3, "element_text": "Read more"})
     assert is_sensitive(action) is False

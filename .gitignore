@@ -17,3 +17,6 @@ wheels/
 .config/
 playwright-report/
 agent_history/
+
+# Benchmark run artifacts (logs are large and regenerate on each run)
+benchmarks/bench*.log

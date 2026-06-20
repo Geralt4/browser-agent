@@ -9,6 +9,10 @@ from browser_agent.safety.types import PendingAction, SafetyDecision
 
 DELETE = PendingAction(name="click", params={"index": 1, "element_text": "Delete account"})
 BENIGN = PendingAction(name="navigate", params={"url": "https://example.com"})
+NAV_POST = PendingAction(
+    name="navigate",
+    params={"url": "https://httpbin.org/forms/post", "new_tab": False},
+)
 
 
 def _layer(approve: bool, **cfg_kw) -> tuple[SafetyLayer, list]:
@@ -55,6 +59,15 @@ def test_blocklist_blocks_navigation():
         layer.guard(PendingAction(name="navigate", params={"url": "https://www.evil.com/x"}))
     )
     assert decision.allow is False
+
+
+def test_navigate_with_post_in_url_not_gated():
+    """Navigation to a URL containing 'post' must not trigger the keyword
+    classifier — the allow/block list is the right gate for navigation."""
+    layer, calls = _layer(approve=False)  # would deny if gate reached
+    decision = asyncio.run(layer.guard(NAV_POST))
+    assert decision.allow is True
+    assert calls == []  # gate was never consulted
 
 
 def test_streaming_gate_cleans_up_on_cancel():

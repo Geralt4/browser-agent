@@ -56,7 +56,15 @@ def is_sensitive(action: PendingAction) -> bool:
     on, `classify_sensitive_llm()` runs as a fallback. Keep the keyword list
     and the personal-data regexes in sync with the brief's sensitive categories
     (send, publish, purchase, delete, submit, account-state changes, PII).
+
+    Navigation is excluded: the allow/block list (check_navigation) is the
+    right gate for URLs. Matching keywords against the URL itself produces
+    false positives for any path containing words like "post", "delete",
+    "submit", etc.
     """
+    if action.name == "navigate":
+        return False
+
     blob = " ".join(str(v) for v in action.params.values()).lower()
     if any(kw in blob for kw in SENSITIVE_KEYWORDS):
         return True
