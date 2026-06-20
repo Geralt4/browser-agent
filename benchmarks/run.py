@@ -26,6 +26,8 @@ from browser_agent.agent.loop import run_task
 from browser_agent.config import Config, load_config
 from browser_agent.models.registry import get_adapter
 from browser_agent.safety import SafetyLayer
+from browser_agent.safety.gate import ConfirmationGate
+from browser_agent.safety.types import SafetyDecision
 
 BENCH_DIR = Path(__file__).parent
 TASKS_FILE = BENCH_DIR / "tasks.jsonl"
@@ -51,9 +53,9 @@ def filter_tasks(tasks: list[dict], ids: list[str] | None, category: str | None)
     return tasks
 
 
-async def run_one(task: dict, cfg: Config) -> dict[str, object]:
+async def run_one(task: dict, cfg: Config, gate: ConfirmationGate) -> dict[str, object]:
     adapter = get_adapter(cfg)
-    safety = SafetyLayer(cfg)
+    safety = SafetyLayer(cfg, gate=gate)
 
     started = time.monotonic()
     try:
@@ -83,13 +85,13 @@ async def run_one(task: dict, cfg: Config) -> dict[str, object]:
         }
 
 
-async def run_all(tasks: list[dict], cfg: Config, concurrency: int = 1) -> list[dict]:
+async def run_all(tasks: list[dict], cfg: Config, gate: ConfirmationGate, concurrency: int = 1) -> list[dict]:
     results: list[dict] = []
     sem = asyncio.Semaphore(concurrency)
 
     async def bounded(task: dict) -> None:
         async with sem:
-            results.append(await run_one(task, cfg))
+            results.append(await run_one(task, cfg, gate))
 
     await asyncio.gather(*(bounded(t) for t in tasks))
     results.sort(key=lambda r: str(r["id"]))
@@ -111,6 +113,12 @@ def main() -> None:
     parser.add_argument("--ids", type=str, help="Comma-separated task IDs to run")
     parser.add_argument("--category", type=str, help="Filter by category")
     parser.add_argument("--concurrency", type=int, default=1, help="Parallel tasks (default 1)")
+    parser.add_argument(
+        "--gate",
+        choices=["auto-deny", "auto-approve"],
+        default="auto-deny",
+        help="Confirmation gate strategy (default: auto-deny)",
+    )
     args = parser.parse_args()
 
     _HAS_KEY = bool(os.getenv("MOONSHOT_API_KEY") or os.getenv("LLM_API_KEY"))
@@ -128,12 +136,22 @@ def main() -> None:
     elif args.dom:
         cfg.vision_mode = "dom"
 
+    async def _auto_deny(action):
+        return SafetyDecision(allow=False, reason="auto-denied (benchmark)")
+
+    async def _auto_approve(action):
+        return SafetyDecision(allow=True, reason="auto-approved (benchmark)")
+
+    gate = ConfirmationGate(
+        confirm=_auto_deny if args.gate == "auto-deny" else _auto_approve
+    )
+
     mode = cfg.vision_mode
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     out = RESULTS_DIR / f"{ts}_{mode}.csv"
 
-    print(f"Running {len(tasks)} tasks (mode={mode}, concurrency={args.concurrency})")
-    results = asyncio.run(run_all(tasks, cfg, concurrency=args.concurrency))
+    print(f"Running {len(tasks)} tasks (mode={mode}, gate={args.gate}, concurrency={args.concurrency})")
+    results = asyncio.run(run_all(tasks, cfg, gate, concurrency=args.concurrency))
 
     write_csv(results, out)
 

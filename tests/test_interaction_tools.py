@@ -113,3 +113,29 @@ def test_gate_blocks_destructive_click(fixture_url):
     assert "blocked by safety layer" in result["error"]
     # The page's onclick never fired -> the destructive effect was prevented.
     assert result["out_text"] == "safe"
+
+
+def test_done_params_tolerates_deepseek_extra_success():
+    """DeepSeek emits done: {result: ..., success: true} — the extra success
+    field must not trigger a union explosion."""
+    from browser_agent.tools.actions import DoneParams
+
+    d = DoneParams.model_validate({"result": "The page title is httpbin.org.", "success": True})
+    assert d.result == "The page title is httpbin.org."
+
+
+def test_done_action_registry_accepts_deepseek_payload():
+    """The full action registry must validate and execute a done action with
+    the DeepSeek-shaped payload."""
+    from browser_agent.config import Config
+    from browser_agent.safety import SafetyLayer
+    from browser_agent.tools.actions import build_tools
+
+    registry = build_tools(SafetyLayer(Config())).registry
+    am = registry.create_action_model()
+    import typing
+
+    args = typing.get_args(am.model_fields["root"].annotation)
+    done_variant = next(a for a in args if "Done" in a.__name__)
+    out = done_variant.model_validate({"done": {"result": "ok", "success": True}})
+    assert out.done.result == "ok"

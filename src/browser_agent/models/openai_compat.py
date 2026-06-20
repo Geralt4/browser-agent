@@ -37,6 +37,12 @@ class GenericOpenAIAdapter(ModelAdapter):
             model=self._cfg.llm_model,
             base_url=self._cfg.llm_base_url,  # None -> api.openai.com
             api_key=self._cfg.llm_api_key,
+            # Compatibility flags for non-OpenAI structured output. Many providers
+            # (DeepSeek, Moonshot, Ollama, vLLM, etc.) reject browser-use's default
+            # strict response_format schema with HTTP 400 ("response_format type
+            # unavailable"). dont_force_structured_output keeps the schema in the
+            # system prompt instead, which is the universally-supported path.
             add_schema_to_system_prompt=True,
             remove_min_items_from_schema=True,
+            dont_force_structured_output=True,
         )

@@ -34,7 +34,11 @@ class KimiAdapter(ModelAdapter):
             model=KIMI_MODEL,
             base_url=MOONSHOT_BASE_URL,
             api_key=self._cfg.moonshot_api_key,
-            # Compatibility flags for non-OpenAI structured output.
+            # Compatibility flags for non-OpenAI structured output. Kimi's
+            # OpenAI-compatible endpoint rejects the strict response_format
+            # schema browser-use sends by default, so we keep the schema in
+            # the system prompt and skip forcing structured output.
             add_schema_to_system_prompt=True,
             remove_min_items_from_schema=True,
+            dont_force_structured_output=True,
         )

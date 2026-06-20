@@ -5,6 +5,7 @@ from browser_use.browser.events import (
     ScrollEvent,
     TypeTextEvent,
 )
+from pydantic import BaseModel, ConfigDict
 
 from browser_agent.safety import PendingAction, SafetyLayer
 
@@ -18,6 +19,23 @@ from browser_agent.safety import PendingAction, SafetyLayer
 # the same name below. Tightening the full toolset to exactly the Phase 3 six is
 # a Phase 4 hardening step.
 EXCLUDED_BUILTINS = ["input", "evaluate"]
+
+
+class DoneParams(BaseModel):
+    """Param model for the done action that tolerates extra fields.
+
+    DeepSeek (and some other providers) emit ``done: {result: "...", success: true}``
+    — the ``success`` field is not part of our schema.  With the default
+    ``extra='forbid'`` that browser-use infers from the function signature, that
+    extra field triggers a discriminated-union explosion (all 24 action variants
+    fail) and the agent hits the consecutive-failure stop after 6 retries.
+
+    ``extra='ignore'`` silently drops ``success`` (and any other extras) so the
+    union resolves cleanly to the done variant.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    result: str
 
 
 def _node_label(node) -> str:
@@ -128,10 +146,13 @@ def build_tools(safety: SafetyLayer) -> Tools:
             include_in_memory=True,
         )
 
-    @tools.action("Signal that the task is complete and return the final result to the user")
-    async def done(result: str, browser_session: BrowserSession) -> ActionResult:
+    @tools.action(
+        "Signal that the task is complete and return the final result to the user",
+        param_model=DoneParams,
+    )
+    async def done(params: DoneParams, browser_session: BrowserSession) -> ActionResult:
         return ActionResult(
-            extracted_content=result,
+            extracted_content=params.result,
             is_done=True,
         )
 
