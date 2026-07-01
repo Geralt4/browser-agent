@@ -28,69 +28,91 @@ import json
 import struct
 import sys
 
+# Chrome's native messaging limit. A hostile extension could otherwise send
+# a length prefix of 0xFFFFFFFF and cause a 4 GB allocation attempt.
+MAX_MESSAGE_SIZE = 1024 * 1024
+
 
 def main() -> int:
     try:
         import keyring
     except ImportError:
-        send({"ok": False, "error": "keyring library not installed"})
+        send({"ok": False, "error": "keyring library not installed", "_id": None})
         return 1
 
     try:
         while True:
-            raw = read_message()
-            if raw is None:
+            # Read the 4-byte length prefix.
+            header = sys.stdin.buffer.read(4)
+            if not header or len(header) < 4:
                 return 0
+            (length,) = struct.unpack("<I", header)
+            # Cap at Chrome's native messaging limit (1 MB) to prevent
+            # 4 GB allocation DoS via a hostile length prefix. Drain the
+            # oversized payload to keep the stream aligned.
+            if length > MAX_MESSAGE_SIZE:
+                send({"ok": False, "error": f"message exceeds {MAX_MESSAGE_SIZE} byte limit", "_id": None})
+                sys.stdin.buffer.read(min(length, MAX_MESSAGE_SIZE))
+                continue
+            if length == 0:
+                raw = b""
+            else:
+                raw = sys.stdin.buffer.read(length)
+                # A short read means EOF mid-message; the stream is now
+                # desynchronized, so we exit cleanly rather than crash on
+                # the next length parse.
+                if len(raw) < length:
+                    return 0
             try:
                 msg = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                send({"ok": False, "error": f"invalid JSON: {exc}"})
+                send({"ok": False, "error": f"invalid JSON: {exc}", "_id": None})
                 continue
 
+            if not isinstance(msg, dict):
+                # Valid JSON, but not a dict — msg.get() would raise and
+                # crash the whole host. Return an error and keep the loop
+                # alive so a single bad message can't kill the process.
+                send({"ok": False, "error": "expected a JSON object", "_id": None})
+                continue
+
+            # Initialize _id before any msg.get() so the outer crash handler
+            # always has a defined value.
+            _id = None
             cmd = msg.get("cmd")
+            # Echo the request's correlation id so the extension can match
+            # responses to outstanding calls on a shared port. None when
+            # the caller didn't supply one (or the request was unparseable).
+            _id = msg.get("_id")
             try:
                 if cmd == "ping":
-                    send({"ok": True, "pong": True})
+                    send({"ok": True, "pong": True, "_id": _id})
                 elif cmd == "set_key":
                     keyring.set_password(
                         msg["service"], msg["key"], msg["value"]
                     )
-                    send({"ok": True})
+                    send({"ok": True, "_id": _id})
                 elif cmd == "get_key":
                     value = keyring.get_password(msg["service"], msg["key"])
-                    send({"ok": True, "value": value})
+                    send({"ok": True, "value": value, "_id": _id})
                 elif cmd == "delete_key":
                     try:
                         keyring.delete_password(msg["service"], msg["key"])
                     except keyring.errors.PasswordDeleteError:
                         pass
-                    send({"ok": True})
+                    send({"ok": True, "_id": _id})
                 elif cmd == "list_keys":
-                    send({"ok": True, "hint": "list_keys not supported by keyring API"})
+                    send({"ok": True, "hint": "list_keys not supported by keyring API", "_id": _id})
                 else:
-                    send({"ok": False, "error": f"unknown cmd: {cmd!r}"})
+                    send({"ok": False, "error": f"unknown cmd: {cmd!r}", "_id": _id})
             except Exception as exc:  # noqa: BLE001
-                send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                send({"ok": False, "error": f"{type(exc).__name__}: {exc}", "_id": _id})
 
     except BrokenPipeError:
         return 0
     except Exception as exc:  # noqa: BLE001
-        send({"ok": False, "error": f"host crashed: {exc}"})
+        send({"ok": False, "error": f"host crashed: {exc}", "_id": _id})
         return 1
-
-
-def read_message() -> bytes | None:
-    """Read one Chrome native messaging message from stdin.
-
-    Returns None on EOF. Format: 4-byte little-endian length prefix + UTF-8 body.
-    """
-    header = sys.stdin.buffer.read(4)
-    if not header or len(header) < 4:
-        return None
-    (length,) = struct.unpack("<I", header)
-    if length == 0:
-        return b""
-    return sys.stdin.buffer.read(length)
 
 
 def send(message: dict) -> None:

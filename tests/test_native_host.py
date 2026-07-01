@@ -65,7 +65,7 @@ def _make_unique_key(prefix: str) -> str:
 class TestNativeHost:
     def test_ping(self):
         r = _run_host([{"cmd": "ping"}])
-        assert r[0] == {"ok": True, "pong": True}
+        assert r[0] == {"ok": True, "pong": True, "_id": None}
 
     def test_set_then_get_then_delete(self):
         service = "browser-agent-test"
@@ -78,28 +78,33 @@ class TestNativeHost:
             {"cmd": "delete_key", "service": service, "key": key},
             {"cmd": "get_key", "service": service, "key": key},
         ])
-        assert r[0] == {"ok": True}
-        assert r[1] == {"ok": True, "value": value}
-        assert r[2] == {"ok": True}
+        assert r[0] == {"ok": True, "_id": None}
+        assert r[1] == {"ok": True, "value": value, "_id": None}
+        assert r[2] == {"ok": True, "_id": None}
         # After delete, value is None
-        assert r[3] == {"ok": True, "value": None}
+        assert r[3] == {"ok": True, "value": None, "_id": None}
 
     def test_unknown_cmd(self):
         r = _run_host([{"cmd": "wat"}])
         assert r[0]["ok"] is False
         assert "unknown cmd" in r[0]["error"]
+        assert r[0]["_id"] is None
+
+    def test_echoes_request_id(self):
+        r = _run_host([{"cmd": "ping", "_id": "abc-123"}])
+        assert r[0] == {"ok": True, "pong": True, "_id": "abc-123"}
 
     def test_get_missing_key_returns_null(self):
         service = "browser-agent-test"
         key = _make_unique_key("nonexistent")
         r = _run_host([{"cmd": "get_key", "service": service, "key": key}])
-        assert r[0] == {"ok": True, "value": None}
+        assert r[0] == {"ok": True, "value": None, "_id": None}
 
     def test_delete_missing_key_is_idempotent(self):
         service = "browser-agent-test"
         key = _make_unique_key("ghost")
         r = _run_host([{"cmd": "delete_key", "service": service, "key": key}])
-        assert r[0] == {"ok": True}
+        assert r[0] == {"ok": True, "_id": None}
 
     def test_invalid_json(self):
         proc = subprocess.Popen(
@@ -116,6 +121,57 @@ class TestNativeHost:
             proc.wait(timeout=10)
             # The host will try to read msg.get("cmd") and get None, then return unknown cmd
             assert r["ok"] is False
+            assert r["_id"] is None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_non_dict_json_returns_error_and_continues(self):
+        """A non-dict JSON value (e.g. a list) must not crash the host.
+        The host should return an error and stay alive for the next message."""
+        proc = subprocess.Popen(
+            [sys.executable, str(HOST)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # Send a JSON array (valid JSON, not a dict)
+            proc.stdin.write(_encode([1, 2, 3]))  # type: ignore[arg-type]
+            proc.stdin.flush()
+            r = _decode(proc.stdout)
+            assert r["ok"] is False
+            assert "expected a JSON object" in r["error"]
+            assert r["_id"] is None
+
+            # Host must still be alive — send a ping
+            proc.stdin.write(_encode({"cmd": "ping"}))
+            proc.stdin.flush()
+            r2 = _decode(proc.stdout)
+            assert r2 == {"ok": True, "pong": True, "_id": None}
+
+            proc.stdin.close()
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_string_json_returns_error_and_continues(self):
+        """A bare JSON string must not crash the host either."""
+        proc = subprocess.Popen(
+            [sys.executable, str(HOST)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            proc.stdin.write(_encode("hello"))  # type: ignore[arg-type]
+            proc.stdin.flush()
+            r = _decode(proc.stdout)
+            assert r["ok"] is False
+            assert "expected a JSON object" in r["error"]
+            proc.stdin.close()
+            proc.wait(timeout=10)
         finally:
             if proc.poll() is None:
                 proc.kill()
