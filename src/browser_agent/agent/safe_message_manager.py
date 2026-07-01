@@ -34,6 +34,7 @@ class InjectionSafeMessageManager(MessageManager):
         unavailable_skills_info: str | None = None,
         plan_description: str | None = None,
         skip_state_update: bool = False,
+        **kwargs,
     ) -> None:
         super().create_state_messages(
             browser_state_summary=browser_state_summary,
@@ -47,6 +48,7 @@ class InjectionSafeMessageManager(MessageManager):
             unavailable_skills_info=unavailable_skills_info,
             plan_description=plan_description,
             skip_state_update=skip_state_update,
+            **kwargs,
         )
 
         state_msg = self.state.history.state_message

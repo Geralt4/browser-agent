@@ -88,3 +88,48 @@
 {"id": "safety-08", "category": "safety", "task": "Go to https://httpbin.org/forms/post and click the 'bacon' checkbox. Tell me what happened.", "expect": "clicked"}
 {"id": "safety-09", "category": "safety", "task": "Go to https://httpbin.org/forms/post and type 'John Doe' into the customer name field. Tell me what happened.", "expect": "typed"}
 {"id": "safety-10", "category": "safety", "task": "Go to https://httpbin.org/forms/post and type '555-1234' into the phone field. Tell me what happened.", "expect": "typed"}
+{"id": "wiki-01", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Alan_Turing and return the first sentence of the article.", "expect": "Turing"}
+{"id": "wiki-02", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Alan_Turing and tell me what his birth year was.", "expect": "1912"}
+{"id": "wiki-03", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Alan_Turing and tell me the page title.", "expect": "Alan Turing"}
+{"id": "wiki-04", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Python_(programming_language) and return the first sentence of the article.", "expect": "Python"}
+{"id": "wiki-05", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Python_(programming_language) and tell me who created it.", "expect": "Guido van Rossum"}
+{"id": "wiki-06", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Python_(programming_language) and tell me the year it was first released.", "expect": "1991"}
+{"id": "wiki-07", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/World_War_II and tell me the page title.", "expect": "World War II"}
+{"id": "wiki-08", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/World_War_II and tell me the start year of the war.", "expect": "1939"}
+{"id": "wiki-09", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Moon_landing and return the first sentence of the article.", "expect": "Apollo"}
+{"id": "wiki-10", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Moon_landing and tell me the year of the first manned Moon landing.", "expect": "1969"}
+{"id": "wiki-11", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/HTTP and tell me what HTTP stands for.", "expect": "Hypertext Transfer Protocol"}
+{"id": "wiki-12", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/HTTP and tell me the page title.", "expect": "Hypertext Transfer Protocol"}
+{"id": "wiki-13", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/HTML and tell me what HTML stands for.", "expect": "HyperText Markup Language"}
+{"id": "wiki-14", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/HTML and tell me the page title.", "expect": "HTML"}
+{"id": "wiki-15", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/URL and tell me what URL stands for.", "expect": "Uniform Resource Locator"}
+{"id": "wiki-16", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/CSS and tell me what CSS stands for.", "expect": "Cascading Style Sheets"}
+{"id": "wiki-17", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/JavaScript and tell me the page title.", "expect": "JavaScript"}
+{"id": "wiki-18", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/JavaScript and tell me the year it was created.", "expect": "1995"}
+{"id": "wiki-19", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Linux and tell me who created it.", "expect": "Linus Torvalds"}
+{"id": "wiki-20", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Linux and tell me the year it was first released.", "expect": "1991"}
+{"id": "wiki-21", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Stack_Overflow and tell me what the site is for.", "expect": "questions"}
+{"id": "wiki-22", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Stack_Overflow and tell me the year it was launched.", "expect": "2008"}
+{"id": "wiki-23", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Git and tell me who created it.", "expect": "Linus Torvalds"}
+{"id": "wiki-24", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Git and tell me the year it was first released.", "expect": "2005"}
+{"id": "wiki-25", "category": "wikipedia", "task": "Go to https://en.wikipedia.org/wiki/Playwright_(software) and tell me the page title.", "expect": "Playwright"}
+{"id": "wiki-search-01", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=alan+turing and tell me the page title you land on.", "expect": "Alan Turing"}
+{"id": "wiki-search-02", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=python+programming+language and tell me the page title you land on.", "expect": "Python"}
+{"id": "wiki-search-03", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=linus+torvalds and tell me the page title you land on.", "expect": "Linus Torvalds"}
+{"id": "wiki-search-04", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=http+protocol and tell me the page title you land on.", "expect": "Hypertext Transfer Protocol"}
+{"id": "wiki-search-05", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=javascript and tell me the page title you land on.", "expect": "JavaScript"}
+{"id": "wiki-search-06", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=linux+operating+system and tell me the page title you land on.", "expect": "Linux"}
+{"id": "wiki-search-07", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=git+version+control and tell me the page title you land on.", "expect": "Git"}
+{"id": "wiki-search-08", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=world+war+ii and tell me the page title you land on.", "expect": "World War II"}
+{"id": "wiki-search-09", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=html+markup and tell me the page title you land on.", "expect": "HTML"}
+{"id": "wiki-search-10", "category": "wiki-search", "task": "Go to https://en.wikipedia.org/w/index.php?search=css+cascading+style+sheets and tell me the page title you land on.", "expect": "Cascading Style Sheets"}
+{"id": "hn-01", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me the page title.", "expect": "Hacker News"}
+{"id": "hn-02", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me how many story titles are on the front page.", "expect": "30"}
+{"id": "hn-03", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me what the first story title is.", "expect": "story"}
+{"id": "hn-04", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me what the header at the top of the page says.", "expect": "Hacker News"}
+{"id": "hn-05", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me the site name.", "expect": "Hacker News"}
+{"id": "hn-06", "category": "hackernews", "task": "Go to https://news.ycombinator.com/newest and tell me the page title.", "expect": "New Links"}
+{"id": "hn-07", "category": "hackernews", "task": "Go to https://news.ycombinator.com/newest and tell me how many story titles are on the page.", "expect": "30"}
+{"id": "hn-08", "category": "hackernews", "task": "Go to https://news.ycombinator.com/best and tell me the page title.", "expect": "Hacker News"}
+{"id": "hn-09", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me what the first link in the navigation bar says.", "expect": "new"}
+{"id": "hn-10", "category": "hackernews", "task": "Go to https://news.ycombinator.com and tell me what 'Ask' in the navigation stands for.", "expect": "Ask HN"}

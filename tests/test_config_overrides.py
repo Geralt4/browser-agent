@@ -59,6 +59,14 @@ class TestWithOverrides:
         new = cfg.with_overrides(provider="openai")
         assert new.provider == "openai"
 
+    def test_default_vision_mode_is_vision(self, clean_env):
+        # 135-task A/B (kimi-k2.6) showed vision is +9.6pp pass rate, -46%
+        # latency, -27% input tokens vs DOM. Default flipped from "auto" to
+        # "vision" on that evidence. Pin it here so a refactor can't quietly
+        # undo the decision.
+        cfg = Config()
+        assert cfg.vision_mode == "vision"
+
     def test_returns_new_instance(self, clean_env):
         cfg = Config(llm_api_key="sk-test")
         new = cfg.with_overrides(llm_model="x")

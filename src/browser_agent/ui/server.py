@@ -4,17 +4,22 @@ import asyncio
 import json
 import logging
 import pathlib
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from browser_agent.agent.loop import run_task_streaming
 from browser_agent.config import load_config
-from browser_agent.models.discovery import ModelDiscoveryError, fetch_models
+from browser_agent.models.discovery import (
+    ModelDiscoveryError,
+    fetch_models,
+    is_allowed_base_url,
+)
 from browser_agent.models.registry import get_adapter
 from browser_agent.safety import SafetyLayer, StreamingConfirmationGate
 
@@ -23,6 +28,7 @@ log = logging.getLogger(__name__)
 _TASKS: dict[str, dict[str, Any]] = {}
 _TASK_TTL = 600  # seconds before an orphaned task entry is cleaned up
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+_task_semaphore: asyncio.Semaphore | None = None
 
 
 def _track(task: asyncio.Task) -> asyncio.Task:
@@ -34,11 +40,46 @@ def _track(task: asyncio.Task) -> asyncio.Task:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _task_semaphore
+    cfg = load_config()
+    _task_semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
     _track(asyncio.create_task(_cleanup_orphans()))
     yield
 
 
 app = FastAPI(title="Browser Agent", lifespan=lifespan)
+
+
+def _configured_token() -> str | None:
+    """Return the API token from the current .env, or None if unset.
+
+    Read per-request (not cached at startup) so token rotation via .env edit
+    takes effect without a restart, and so tests can monkeypatch the env.
+    """
+    return load_config().browser_agent_api_token
+
+
+def _require_auth(request: Request) -> None:
+    """FastAPI dependency: reject if no token configured OR header mismatches.
+
+    - No token configured  -> 403 (endpoint disabled, fail-closed)
+    - Header missing       -> 401
+    - Token mismatch       -> 401
+    - Match                -> None (request proceeds)
+
+    Comparison is timing-safe via secrets.compare_digest.
+    """
+    expected = _configured_token()
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="endpoint disabled: set BROWSER_AGENT_API_TOKEN in .env",
+        )
+    provided = request.headers.get("X-Auth-Token", "")
+    if not provided:
+        raise HTTPException(status_code=401, detail="X-Auth-Token header required")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -69,10 +110,19 @@ _CONFIG_KEYS: dict[str, str] = {
     "llm_model": "LLM_MODEL",
     "vision_mode": "VISION_MODE",
     "vision_models": "VISION_MODELS",
+    "headless": "HEADLESS",
+    "max_steps": "MAX_STEPS",
+    "allowlist": "ALLOWLIST",
+    "blocklist": "BLOCKLIST",
+    "kill_switch": "KILL_SWITCH",
+    "sensitivity_llm": "SENSITIVITY_LLM",
+    "dom_categories": "DOM_CATEGORIES",
+    "max_extract_chars": "MAX_EXTRACT_CHARS",
+    "max_concurrent_tasks": "MAX_CONCURRENT_TASKS",
 }
 
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[Depends(_require_auth)])
 async def update_config(request: Request):
     """Persist safe config fields to .env (process-wide, survives restart).
 
@@ -103,19 +153,42 @@ async def update_config(request: Request):
 
 @app.get("/api/models")
 async def list_models(request: Request, base_url: str = ""):
-    """Fetch the model list from the provider's /v1/models endpoint.
+    """Fetch the model list from the configured provider's /v1/models endpoint.
 
-    The API key is read from the X-API-Key header to avoid leaking it into
-    server access logs, browser history, and proxy logs.
+    Security:
+      - Requires X-Auth-Token (see _require_auth).
+      - base_url, if supplied, must match the configured LLM_BASE_URL
+        (normalized comparison). If omitted, the configured LLM_BASE_URL
+        is used. This prevents SSRF: an attacker cannot point us at an
+        arbitrary host and relay the X-API-Key there.
+      - If LLM_BASE_URL is not configured, the endpoint is disabled (403).
     """
-    api_key = request.headers.get("X-API-Key", "")
-    if not base_url or not api_key:
+    cfg = load_config()
+    configured_url = cfg.llm_base_url
+    if not configured_url:
         return JSONResponse(
-            content={"error": "base_url query param and X-API-Key header are required"},
+            content={"error": "endpoint disabled: set LLM_BASE_URL in .env"},
+            status_code=403,
+        )
+
+    if base_url:
+        if not is_allowed_base_url(base_url, configured_url):
+            return JSONResponse(
+                content={"error": "base_url does not match configured LLM_BASE_URL"},
+                status_code=400,
+            )
+        target = base_url
+    else:
+        target = configured_url
+
+    api_key = request.headers.get("X-API-Key", "")
+    if not api_key:
+        return JSONResponse(
+            content={"error": "X-API-Key header is required"},
             status_code=400,
         )
     try:
-        models = fetch_models(base_url, api_key)
+        models = fetch_models(target, api_key)
     except ModelDiscoveryError as exc:
         return JSONResponse(content={"error": str(exc)}, status_code=502)
     return {"models": models}
@@ -127,6 +200,20 @@ async def create_task(request: Request):
     task_text = body.get("task", "").strip()
     if not task_text:
         return JSONResponse(content={"error": "task is required"}, status_code=400)
+
+    # Rate limiting: prevent resource exhaustion from concurrent browser sessions.
+    # Use a short-timeout acquire (no separate locked() check) so the check
+    # and acquire are atomic — no TOCTOU race where two requests both see
+    # locked()==False and one blocks indefinitely on the second acquire.
+    sem = _task_semaphore
+    if sem is not None:
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=0.05)
+        except TimeoutError:
+            return JSONResponse(
+                content={"error": "too many concurrent tasks — try again later"},
+                status_code=429,
+            )
 
     cfg = load_config()
     overrides = {
@@ -142,9 +229,11 @@ async def create_task(request: Request):
     try:
         adapter = get_adapter(cfg)
     except ValueError as exc:
+        if sem is not None:
+            sem.release()
         return JSONResponse(content={"error": str(exc)}, status_code=400)
 
-    task_id = uuid.uuid4().hex[:8]
+    task_id = uuid.uuid4().hex[:12]  # 48 bits — collision-resistant for practical use
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     gate = StreamingConfirmationGate()
 
@@ -166,6 +255,13 @@ async def create_task(request: Request):
                 safety=safety,
                 queue=queue,
             )
+        except asyncio.CancelledError:
+            log.info("Task %s cancelled", task_id)
+            try:
+                await queue.put({"type": "error", "message": "Task cancelled"})
+            except Exception:
+                pass
+            raise
         except Exception as exc:
             log.exception("Task %s failed", task_id)
             try:
@@ -173,6 +269,8 @@ async def create_task(request: Request):
             except Exception:
                 pass
         finally:
+            if sem is not None:
+                sem.release()
             _TASKS.pop(task_id, None)
 
     _TASKS[task_id]["task"] = _track(asyncio.create_task(_run_and_cleanup()))
@@ -236,44 +334,27 @@ def _env_path() -> pathlib.Path:
 
 
 def _read_env(path: pathlib.Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    out: dict[str, str] = {}
-    for line in pathlib.Path(path).read_text().splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, v = s.split("=", 1)
-        out[k.strip()] = v.strip()
-    return out
+    """Read .env using python-dotenv for correct quoting/escaping handling."""
+    from dotenv import dotenv_values
+    raw = dotenv_values(str(path))
+    return {k: v for k, v in raw.items() if v is not None}
 
 
 def _write_env(path: pathlib.Path, values: dict[str, str]) -> None:
-    lines = []
-    seen: set[str] = set()
-    if path.exists():
-        for line in pathlib.Path(path).read_text().splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                lines.append(line)
-                continue
-            k = s.split("=", 1)[0].strip()
-            if k in values:
-                lines.append(f"{k}={values[k]}")
-                seen.add(k)
-            else:
-                lines.append(line)
+    """Write .env using python-dotenv for correct quoting/escaping handling."""
+    from dotenv import set_key
     for k, v in values.items():
-        if k not in seen:
-            lines.append(f"{k}={v}")
-    pathlib.Path(path).write_text("\n".join(lines) + "\n")
+        set_key(str(path), k, v)
 
 
 async def _cleanup_orphans() -> None:
     while True:
         await asyncio.sleep(60)
         now = asyncio.get_running_loop().time()
-        stale = [tid for tid, e in _TASKS.items() if now - e.get("created", 0) > _TASK_TTL]
+        stale = [
+            tid for tid, e in list(_TASKS.items())
+            if now - e.get("created", 0) > _TASK_TTL
+        ]
         for tid in stale:
             entry = _TASKS.pop(tid, None)
             if entry is not None:

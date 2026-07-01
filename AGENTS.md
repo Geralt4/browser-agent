@@ -5,9 +5,10 @@
 ```bash
 uv run browser-agent "go to example.com and return the H1"   # CLI task
 uv run browser-agent-ui                                       # Web UI on 127.0.0.1:8000
+uv run ruff check .                                            # lint
+npx --yes pyright@1.1.410                                     # typecheck (matches CI)
 uv run pytest                                                 # all tests
 uv run pytest tests/test_injection.py -v                       # single file
-uv run ruff check .                                            # lint (no typecheck step)
 ```
 
 API-key gated tests (`test_hello_world.py`, `test_interaction_llm.py`, `test_injection.py`)

@@ -13,6 +13,7 @@ from browser_agent.models.discovery import (
     _extract_model_ids,
     _normalize_url,
     fetch_models,
+    is_allowed_base_url,
 )
 
 
@@ -35,6 +36,44 @@ class TestNormalizeUrl:
 
     def test_strips_whitespace(self):
         assert _normalize_url("  https://api.openai.com  ") == "https://api.openai.com/v1"
+
+
+class TestIsAllowedBaseUrl:
+    def test_exact_match(self):
+        assert is_allowed_base_url(
+            "https://api.openai.com", "https://api.openai.com"
+        )
+
+    def test_trailing_slash_match(self):
+        assert is_allowed_base_url(
+            "https://api.openai.com/", "https://api.openai.com"
+        )
+
+    def test_v1_suffix_match(self):
+        assert is_allowed_base_url(
+            "https://api.openai.com/v1", "https://api.openai.com"
+        )
+
+    def test_mismatch_rejected(self):
+        assert not is_allowed_base_url(
+            "https://evil.com", "https://api.openai.com"
+        )
+
+    def test_malicious_subdomain_rejected(self):
+        assert not is_allowed_base_url(
+            "https://api.openai.com.evil.com", "https://api.openai.com"
+        )
+
+    def test_no_configured_url_rejects_all(self):
+        assert not is_allowed_base_url("https://api.openai.com", None)
+        assert not is_allowed_base_url("https://api.openai.com", "")
+
+    def test_no_requested_url_rejected(self):
+        assert not is_allowed_base_url("", "https://api.openai.com")
+        assert not is_allowed_base_url(None, "https://api.openai.com")
+
+    def test_malformed_requested_rejected(self):
+        assert not is_allowed_base_url("not a url", "https://api.openai.com")
 
 
 class TestExtractModelIds:

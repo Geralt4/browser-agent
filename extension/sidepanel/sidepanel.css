@@ -147,7 +147,7 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
   max-height: 120px;
   font-family: inherit;
 }
-#task-input:focus { outline: none; border-color: var(--accent); }
+#task-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
 #task-input:disabled { opacity: 0.5; }
 
 /* ---------------- settings tab ---------------- */
@@ -195,6 +195,7 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 }
 .form input:focus, .form select:focus {
   outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 .form input:disabled, .form select:disabled { opacity: 0.5; }
 .hint { font-size: 0.7rem; color: var(--muted); }
@@ -229,7 +230,7 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 /* ---------------- buttons ---------------- */
 .btn {
   padding: 8px 14px;
-  border: none;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   cursor: pointer;
   font-size: 0.85rem;
@@ -237,10 +238,14 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
   transition: opacity 0.15s;
   background: var(--surface);
   color: var(--text);
-  border: 1px solid var(--border);
 }
 .btn:hover:not(:disabled) { opacity: 0.85; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:focus-visible,
+.tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
 .btn--primary { background: var(--accent); color: #111; border-color: var(--accent); }
 .btn--success { background: var(--success); color: #111; }
 .btn--danger  { background: var(--danger);  color: #fff; }
@@ -290,4 +295,4 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 .modal .action-detail dt { color: var(--muted); font-size: 0.65rem; text-transform: uppercase; margin-top: 6px; }
 .modal .action-detail dd { margin-left: 0; word-break: break-all; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.hidden { display: none !important; }
+.hidden { display: none; }

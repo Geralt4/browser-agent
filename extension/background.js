@@ -7,26 +7,26 @@ const KEYRING_SERVICE = "browser-agent";
 
 // Open the side panel when the user clicks the extension action.
 chrome.action.onClicked.addListener(async (tab) => {
-  await chrome.sidePanel.open({ tabId: tab.id });
+  try { await chrome.sidePanel.open({ tabId: tab.id }); } catch { /* tab closed */ }
 });
 
 // Configure the side panel to open on action click.
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
-// In-memory cache of the native host connection (sockets are expensive to
-// create and are short-lived on the OS side; we keep one warm).
-let nativePort = null;
+// Monotonic counter for tagging outgoing native-host calls. Each call gets a
+// unique id; the host echoes it back in its response, and we use it to match
+// responses to the promise that owns them on the shared port.
+let nextNativeId = 1;
 
+// Create a fresh native port for each call. We previously cached the port
+// to avoid the cost of reconnecting, but chrome.runtime.connectNative is
+// near-instant (it reuses the underlying host process) and a cached port
+// introduced TOCTOU races and leaked onDisconnect listeners across calls.
 function connectNative() {
-  if (nativePort) return nativePort;
-  nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-  nativePort.onDisconnect.addListener(() => {
-    nativePort = null;
-  });
-  return nativePort;
+  return chrome.runtime.connectNative(NATIVE_HOST_NAME);
 }
 
-function sendToNative(message) {
+function sendToNative(message, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     let port;
     try {
@@ -35,19 +35,53 @@ function sendToNative(message) {
       reject(new Error(`native host unavailable: ${err.message}`));
       return;
     }
+    const id = nextNativeId++;
+    // `settled` prevents double-resolve/reject when the timeout, response,
+    // and disconnect handlers race against each other.
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { port.disconnect(); } catch { /* already disconnected */ }
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      port.onMessage.removeListener(handler);
+      port.onDisconnect.removeListener(disconnectHandler);
+      reject(new Error("native host timed out"));
+    }, timeoutMs);
     const handler = (response) => {
+      // Ignore messages that belong to other outstanding calls on this port.
+      if (!response || response._id !== id) return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       port.onMessage.removeListener(handler);
       port.onDisconnect.removeListener(disconnectHandler);
       resolve(response);
     };
     const disconnectHandler = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       port.onMessage.removeListener(handler);
-      nativePort = null;
+      try { port.disconnect(); } catch { /* already disconnected */ }
       reject(new Error("native host disconnected"));
     };
     port.onMessage.addListener(handler);
     port.onDisconnect.addListener(disconnectHandler);
-    port.postMessage(message);
+    try {
+      port.postMessage({ ...message, _id: id });
+    } catch (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      port.onMessage.removeListener(handler);
+      port.onDisconnect.removeListener(disconnectHandler);
+      reject(new Error(`native host postMessage failed: ${err.message}`));
+    }
   });
 }
 

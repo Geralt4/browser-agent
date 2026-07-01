@@ -75,6 +75,7 @@ def test_streaming_gate_cleans_up_on_cancel():
     from browser_agent.safety.gate import StreamingConfirmationGate
 
     gate = StreamingConfirmationGate()
+    gate.set_queue(asyncio.Queue())  # required since MEDIUM fix
     action = PendingAction(name="click", params={"index": 1, "element_text": "Delete"})
 
     async def run():

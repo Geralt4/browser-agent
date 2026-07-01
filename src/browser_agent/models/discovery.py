@@ -72,6 +72,24 @@ def _normalize_url(base_url: str) -> str:
     return url
 
 
+def is_allowed_base_url(requested: str | None, configured: str | None) -> bool:
+    """Return True iff `requested` is safe to fetch models from (SSRF guard).
+
+    The caller-supplied base_url must normalize-match the configured
+    LLM_BASE_URL. If `configured` is unset, no URL is allowed. If
+    `requested` is empty/None, returns False (caller should fall back to
+    `configured` before calling this).
+    """
+    if not configured:
+        return False
+    if not requested:
+        return False
+    try:
+        return _normalize_url(requested) == _normalize_url(configured)
+    except ModelDiscoveryError:
+        return False
+
+
 def _extract_model_ids(data: object) -> list[str]:
     """Extract a list of model ID strings from the OpenAI /v1/models response.
 

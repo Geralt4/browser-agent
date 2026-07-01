@@ -14,6 +14,16 @@ class GenericOpenAIAdapter(ModelAdapter):
     moving to Kimi is just a provider/config change.
     """
 
+    # Compatibility flags for non-OpenAI structured output. Many providers
+    # (DeepSeek, Moonshot, Ollama, vLLM, etc.) reject browser-use's default
+    # strict response_format schema with HTTP 400 ("response_format type
+    # unavailable"). dont_force_structured_output keeps the schema in the
+    # system prompt instead, which is the universally-supported path.
+    # These can be overridden per-provider via the adapter subclass.
+    _compat_add_schema: bool = True
+    _compat_remove_min_items: bool = True
+    _compat_dont_force_structured: bool = True
+
     def __init__(self, cfg: Config) -> None:
         if not cfg.llm_model:
             raise ValueError("LLM_MODEL is not set for the 'openai' provider.")
@@ -42,7 +52,7 @@ class GenericOpenAIAdapter(ModelAdapter):
             # strict response_format schema with HTTP 400 ("response_format type
             # unavailable"). dont_force_structured_output keeps the schema in the
             # system prompt instead, which is the universally-supported path.
-            add_schema_to_system_prompt=True,
-            remove_min_items_from_schema=True,
-            dont_force_structured_output=True,
+            add_schema_to_system_prompt=self._compat_add_schema,
+            remove_min_items_from_schema=self._compat_remove_min_items,
+            dont_force_structured_output=self._compat_dont_force_structured,
         )

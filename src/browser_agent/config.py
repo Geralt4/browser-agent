@@ -34,8 +34,12 @@ class Config(BaseSettings):
     max_steps: int = 25
 
     # Vision routing: "dom" = always DOM-only, "auto" = per-task heuristic,
-    # "vision" = always use vision (if model supports it).
-    vision_mode: str = "auto"
+    # "vision" = always use vision (if model supports it). Default is "vision"
+    # because the 135-task A/B (kimi-k2.6) showed +9.6pp pass rate, -46%
+    # latency, and -27% input tokens vs DOM-only. "auto" remains available
+    # for users who want per-task routing; "dom" stays for token-cost-critical
+    # workloads.
+    vision_mode: str = Field(default="vision", pattern=r"^(dom|vision|auto|category)$")
 
     # User-configured comma-separated list of vision-capable model names.
     # GenericOpenAIAdapter treats the model as vision-capable iff its name
@@ -52,6 +56,31 @@ class Config(BaseSettings):
     blocklist: str | None = None
     kill_switch: bool = False
 
+    # Maximum characters of DOM content returned by the extract tool.
+    # Default 8000 — enough for context without blowing out the token window.
+    max_extract_chars: int = 8000
+
+    # Maximum number of concurrent browser-agent tasks. When the limit is
+    # reached, POST /api/task returns 429. Default 3 — browser sessions are
+    # resource-heavy; raise only if you have the RAM/CPU for it.
+    max_concurrent_tasks: int = 3
+
+    # UI API auth: shared secret required for mutating/discovery endpoints
+    # (POST /api/config, GET /api/models). When unset, those endpoints are
+    # disabled (403). Set via .env — NOT writable through POST /api/config.
+    browser_agent_api_token: str | None = None
+
+    # Data-driven per-category routing (vision_mode="category"). Comma-
+    # separated category names that should route to DOM-only instead of
+    # vision. Populated from the A/B benchmark; safe to leave empty for
+    # users who don't have repeat-based data yet.
+    #
+    # Default rule from 45-task x 3 repeats A/B (kimi-k2.6): the only
+    # category where vision's CI excludes zero is `multi-step` (+33pp).
+    # `safety` is excluded because the DOM-wins signal there was an
+    # httpbin 503 artifact, not a real routing signal.
+    dom_categories: str | None = None
+
     @property
     def allow_hosts(self) -> list[str]:
         return _csv(self.allowlist)
@@ -59,6 +88,11 @@ class Config(BaseSettings):
     @property
     def block_hosts(self) -> list[str]:
         return _csv(self.blocklist)
+
+    @property
+    def dom_category_list(self) -> list[str]:
+        """Categories to route to DOM-only when vision_mode == 'category'."""
+        return _csv(self.dom_categories)
 
     def with_overrides(self, **kwargs: Any) -> Config:
         """Return a new Config with the given fields overridden.

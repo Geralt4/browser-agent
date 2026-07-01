@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # ── Hidden-element patterns (remove the whole line) ──────────────────────
 _HIDDEN_CSS_RE = re.compile(
@@ -10,10 +11,14 @@ _HIDDEN_CSS_RE = re.compile(
 _ARIA_HIDDEN_RE = re.compile(r"""aria-hidden\s*=\s*["']true["']""", re.IGNORECASE)
 
 # ── Off-screen patterns (remove the whole line) ──────────────────────────
+# Matches elements positioned far off-screen (≥1000px) OR hidden via
+# position:fixed/absolute with small offsets combined with overflow:hidden
+# on a parent — a common pattern for visually-hidden injection text.
 _OFFSCREEN_RE = re.compile(
     r"(?:left|top|right|bottom)\s*:\s*-?\d{4,}px|"
     r"position\s*:\s*(?:fixed|absolute)\s*;\s*(?:left|top)\s*:\s*-?\d{4,}px|"
-    r"transform\s*:\s*translate[XY]?\s*\(\s*-?\d{4,}",
+    r"transform\s*:\s*translate[XY]?\s*\(\s*-?\d{4,}|"
+    r"overflow\s*:\s*hidden\s*;.*(?:left|top)\s*:\s*-?\d{3,}px",
     re.IGNORECASE,
 )
 
@@ -103,6 +108,41 @@ _INSTRUCTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "[FILTERED:instruction]",
     ),
+    (
+        re.compile(
+            r"new\s+(?:instructions?|prompt|directive|task)\s*(?::|is|now|from)",
+            re.IGNORECASE,
+        ),
+        "[FILTERED:instruction]",
+    ),
+    (
+        re.compile(
+            r"updated\s+(?:instructions?|prompt|directive)",
+            re.IGNORECASE,
+        ),
+        "[FILTERED:instruction]",
+    ),
+    (
+        re.compile(
+            r"from\s+now\s+on\s+(?:you\s+(?:are|must|should|will)|your)",
+            re.IGNORECASE,
+        ),
+        "[FILTERED:instruction]",
+    ),
+    (
+        re.compile(
+            r"your\s+new\s+(?:task|goal|objective|job|role)\s+(?:is|:)",
+            re.IGNORECASE,
+        ),
+        "[FILTERED:instruction]",
+    ),
+    (
+        re.compile(
+            r"disregard\s+(?:everything|all)\s+(?:and|&)",
+            re.IGNORECASE,
+        ),
+        "[FILTERED:instruction]",
+    ),
 ]
 
 
@@ -111,7 +151,14 @@ def sanitize(page_content: str) -> str:
 
     Strips hidden DOM text, off-screen elements, and instruction-like
     patterns that are the primary failure mode of browser agents.
+
+    Applies Unicode NFKC normalization first to defeat homoglyph attacks
+    (e.g. Cyrillic 'і' → Latin 'i').
     """
+    # NFKC normalization converts homoglyphs to their canonical forms,
+    # defeating Unicode-based bypasses of the instruction patterns below.
+    page_content = unicodedata.normalize("NFKC", page_content)
+
     lines = page_content.split("\n")
     kept: list[str] = []
 

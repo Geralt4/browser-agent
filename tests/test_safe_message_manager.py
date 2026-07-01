@@ -26,10 +26,13 @@ def test_override_mirrors_parent_create_state_messages_params():
     override = _params(
         inspect.signature(InjectionSafeMessageManager.create_state_messages)
     )
-    assert override == parent, (
+    # **kwargs is intentionally added for forward compatibility with
+    # browser-use upgrades — it's not a drift, it's a safety net.
+    override_without_kwargs = override - {"kwargs"}
+    assert override_without_kwargs == parent, (
         "InjectionSafeMessageManager.create_state_messages params drifted from "
-        f"MessageManager. Missing in override: {parent - override}. "
-        f"Extra in override: {override - parent}. "
+        f"MessageManager. Missing in override: {parent - override_without_kwargs}. "
+        f"Extra in override: {override_without_kwargs - parent}. "
         "Update the override signature so sanitization keeps working."
     )
 

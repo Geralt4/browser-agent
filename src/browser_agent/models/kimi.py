@@ -25,7 +25,7 @@ class KimiAdapter(ModelAdapter):
         if not cfg.moonshot_api_key:
             raise ValueError(
                 "MOONSHOT_API_KEY is not set. Add it to .env or switch "
-                "BROWSER_AGENT_PROVIDER to a different provider."
+                "PROVIDER to a different provider."
             )
         self._cfg = cfg
 

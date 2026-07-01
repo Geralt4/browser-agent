@@ -49,6 +49,12 @@ class StreamingConfirmationGate(ConfirmationGate):
         self._pending_queue = queue
 
     async def _streaming_confirm(self, action: PendingAction) -> SafetyDecision:
+        if self._pending_queue is None:
+            raise RuntimeError(
+                "StreamingConfirmationGate.set_queue() must be called before "
+                "the gate is used. Wire it in the streaming loop with "
+                "gate.set_queue(queue)."
+            )
         gate_id = uuid.uuid4().hex[:8]
         payload = {
             "type": "gate",

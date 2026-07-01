@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 from browser_use import Agent, BrowserProfile
+from browser_use.llm.base import BaseChatModel
 
 from browser_agent.agent.safe_message_manager import InjectionSafeMessageManager
+from browser_agent.agent.step import AgentStep
 from browser_agent.config import Config
 from browser_agent.models.base import ModelAdapter
 from browser_agent.perception.vision_router import resolve_use_vision, should_use_vision
@@ -17,17 +20,47 @@ _PARAM_TO_ATTR: dict[str, str] = {
 }
 
 
+def _extract_step(model_output: object, n_steps: int) -> AgentStep:
+    """Map a browser-use model_output onto our AgentStep schema.
+
+    The browser-use AgentState attribute names (evaluation_previous_goal,
+    next_goal, memory) are an unstable coupling point. Centralizing the
+    mapping here means a browser-use rename only has to be fixed in one
+    place — and tests in test_agent_step.py pin the mapping.
+    """
+    state = getattr(model_output, "current_state", None) if model_output else None
+    actions = getattr(model_output, "action", None) if model_output else None
+    if not actions:
+        action_repr = ""
+    else:
+        action_repr = repr(actions[0])
+    return AgentStep(
+        step_n=n_steps,
+        assessment=getattr(state, "evaluation_previous_goal", "") or "",
+        memory=getattr(state, "memory", "") or "",
+        next_subgoal=getattr(state, "next_goal", "") or "",
+        action=action_repr,
+    )
+
+
 def _wrap_message_manager(agent: Agent) -> None:
     """Replace agent._message_manager with the injection-safe variant.
 
     Introspects MessageManager.__init__ by name so the patch survives
     browser-use upgrades that add, remove, or reorder params. The only
     manual piece is _PARAM_TO_ATTR for the one known name mismatch.
+
+    If the patch fails (e.g. a browser-use upgrade introduces an
+    incompatible parameter), a warning is logged and the agent continues
+    with the original MessageManager — injection sanitization is degraded
+    but the agent still works.
     """
     import inspect
+    import logging
 
     from browser_use.agent.message_manager.service import MessageManager
 
+    log = logging.getLogger(__name__)
     original = agent._message_manager
     sig = inspect.signature(MessageManager.__init__)
 
@@ -39,7 +72,17 @@ def _wrap_message_manager(agent: Agent) -> None:
         if hasattr(original, attr):
             kwargs[param_name] = getattr(original, attr)
 
-    agent._message_manager = InjectionSafeMessageManager(**kwargs)
+    try:
+        agent._message_manager = InjectionSafeMessageManager(**kwargs)
+    except Exception:
+        log.warning(
+            "Failed to install InjectionSafeMessageManager — "
+            "injection sanitization is disabled for this run. "
+            "This usually means a browser-use upgrade changed "
+            "MessageManager.__init__ parameters. "
+            "Check _PARAM_TO_ATTR in agent/loop.py.",
+            exc_info=True,
+        )
 
 
 async def run_task(
@@ -49,16 +92,75 @@ async def run_task(
 
     For UI-driven workflows, use `run_task_streaming()` instead — it accepts
     an event queue so the caller can stream step results and gate prompts.
+
+    For benchmark use, call `run_task_with_model()` instead so the caller can
+    pass a pre-wrapped (e.g. token-counting) chat model.
+    """
+    return await run_task_with_model(
+        task,
+        cfg=cfg,
+        llm=adapter.chat_model(),
+        supports_vision=adapter.supports_vision,
+        safety=safety,
+    )
+
+
+class _VisionOnlyAdapter(ModelAdapter):
+    """Minimal ModelAdapter shim used only to feed `resolve_use_vision`.
+
+    `run_task_with_model` already has the chat model in hand; building a
+    full ModelAdapter just to pass it through `resolve_use_vision` is
+    wasteful. This shim satisfies the protocol with the one attribute the
+    vision router reads (supports_vision).
+    """
+
+    name = "_benchmark_shim"
+    supports_vision: bool
+
+    def __init__(self, supports_vision: bool) -> None:
+        self.supports_vision = supports_vision
+
+    def chat_model(self) -> BaseChatModel:  # pragma: no cover - never called
+        raise NotImplementedError
+
+
+async def run_task_with_model(
+    task: str,
+    *,
+    cfg: Config,
+    llm: BaseChatModel,
+    supports_vision: bool,
+    safety: SafetyLayer,
+    category: str | None = None,
+    on_step_state: Callable[[object, object, int], Any] | None = None,
+):
+    """Run a task with a caller-supplied chat model.
+
+    Lets the benchmark pass a TokenCountingChatModel-wrapped LLM without
+    needing to subclass ModelAdapter. `supports_vision` is taken from the
+    adapter rather than introspected because the wrapper is transparent.
+
+    `category`, when provided, is forwarded to `resolve_use_vision` so
+    `vision_mode="category"` can apply its data-driven routing rule.
+
+    `on_step_state`, when provided, is registered as a
+    `register_new_step_callback` on the Agent. It receives
+    `(browser_state_summary, model_output, n_steps)` from browser-use on
+    every step. The benchmark uses this to capture the live DOM and final
+    URL *while the browser session is alive* — by the time `agent.run()`
+    returns, the session is torn down and the DOM is gone.
     """
     tools = build_tools(safety)
+    shim = _VisionOnlyAdapter(supports_vision=supports_vision)
     agent = Agent(
         task=task,
-        llm=adapter.chat_model(),
+        llm=llm,
         tools=tools,
         browser_profile=BrowserProfile(headless=cfg.headless),
-        use_vision=resolve_use_vision(cfg, adapter, task),
+        use_vision=resolve_use_vision(cfg, shim, task, category=category),
         max_actions_per_step=1,
         use_judge=False,
+        register_new_step_callback=on_step_state,
     )
 
     _wrap_message_manager(agent)
@@ -109,17 +211,8 @@ async def run_task_streaming(
     async def on_step(browser_state_summary, model_output, n_steps):
         if queue is None:
             return
-        state = model_output.current_state if model_output else None
-        actions = model_output.action if model_output else []
-        action_repr = repr(actions[0]) if actions else ""
-        queue.put_nowait({
-            "type": "step",
-            "step_n": n_steps,
-            "assessment": getattr(state, "evaluation_previous_goal", "") if state else "",
-            "memory": getattr(state, "memory", "") if state else "",
-            "next_subgoal": getattr(state, "next_goal", "") if state else "",
-            "action": action_repr,
-        })
+        step = _extract_step(model_output, n_steps)
+        await queue.put({"type": "step", **step.model_dump()})
 
     tools = build_tools(safety)
     agent = Agent(
@@ -138,6 +231,10 @@ async def run_task_streaming(
     try:
         history = await agent.run(max_steps=cfg.max_steps)
         result = history.final_result() if hasattr(history, "final_result") else str(history)
+    except asyncio.CancelledError:
+        if queue is not None:
+            await queue.put({"type": "error", "message": "Task cancelled"})
+        raise
     except Exception as exc:
         if queue is not None:
             await queue.put({"type": "error", "message": str(exc)})

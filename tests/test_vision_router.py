@@ -123,3 +123,58 @@ def _fake_adapter(*, supports_vision: bool):
     fake = Fake()
     fake.supports_vision = supports_vision
     return fake
+
+
+class TestCategoryRouting:
+    """Data-driven per-category routing — opt-in via vision_mode="category"."""
+
+    def test_category_mode_routes_dom_categories_to_dom(self):
+        cfg = Config(
+            vision_mode="category",
+            dom_categories="wikipedia,wiki-search",
+        )
+        adapter = _fake_adapter(supports_vision=True)
+        # Listed category → DOM
+        assert resolve_use_vision(cfg, adapter, "any task", category="wikipedia") is False
+        assert resolve_use_vision(cfg, adapter, "any task", category="wiki-search") is False
+        # Unlisted category → vision (because model supports it)
+        assert resolve_use_vision(cfg, adapter, "any task", category="navigation") is True
+
+    def test_category_mode_is_case_insensitive(self):
+        cfg = Config(
+            vision_mode="category",
+            dom_categories="Wikipedia,WIKI-SEARCH",
+        )
+        adapter = _fake_adapter(supports_vision=True)
+        assert resolve_use_vision(cfg, adapter, "any task", category="wikipedia") is False
+        assert resolve_use_vision(cfg, adapter, "any task", category="Wiki-Search") is False
+
+    def test_category_mode_falls_back_to_auto_when_category_not_supplied(self):
+        """A caller that hasn't been refactored to plumb categories through
+        should still get sensible behavior. When category is None in
+        category mode, fall through to the keyword heuristic."""
+        cfg = Config(
+            vision_mode="category",
+            dom_categories="wikipedia",
+        )
+        adapter = _fake_adapter(supports_vision=True)
+        # Non-visual task with no category: keyword heuristic → False
+        assert resolve_use_vision(cfg, adapter, "go to example.com") is False
+        # Visual task with no category: keyword heuristic → True
+        assert resolve_use_vision(cfg, adapter, "describe the chart") is True
+
+    def test_category_mode_returns_false_when_model_lacks_vision(self):
+        cfg = Config(
+            vision_mode="category",
+            dom_categories="wikipedia",
+        )
+        adapter = _fake_adapter(supports_vision=False)
+        # Unlisted category, but model doesn't support vision → False
+        assert resolve_use_vision(cfg, adapter, "any task", category="navigation") is False
+
+    def test_empty_dom_categories_means_all_categories_use_vision(self):
+        cfg = Config(vision_mode="category", dom_categories=None)
+        adapter = _fake_adapter(supports_vision=True)
+        # No categories are listed as DOM, so every category routes to vision.
+        assert resolve_use_vision(cfg, adapter, "any task", category="wikipedia") is True
+        assert resolve_use_vision(cfg, adapter, "any task", category="multi-step") is True

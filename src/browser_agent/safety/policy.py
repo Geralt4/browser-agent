@@ -27,10 +27,14 @@ def check_navigation(
 
     Uses suffix-based domain matching: 'example.com' matches 'www.example.com'
     but 'mail' does not match 'gmail.com'.
+
+    Non-HTTP(S) URLs (about:blank, data:, file:, etc.) are allowed through
+    — the allow/block lists only apply to http/https navigation.
     """
     host = host_of(url)
     if not host:
-        return SafetyDecision(allow=False, reason=f"could not parse host from {url!r}")
+        # Non-HTTP(S) URL — allow through (about:blank, data:, file:, etc.)
+        return None
 
     for blocked in block_hosts:
         if _matches(blocked, host):
