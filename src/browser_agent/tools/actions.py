@@ -42,6 +42,9 @@ def _node_label(node) -> str:
     try:
         text = node.get_meaningful_text_for_llm() or node.node_name or ""
     except Exception:
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.debug("Failed to extract node label", exc_info=True)
         text = ""
     return text.strip()[:120]
 
@@ -141,8 +144,9 @@ def build_tools(safety: SafetyLayer) -> Tools:
             return _blocked(decision.reason)
         state = await browser_session.get_browser_state_summary(include_screenshot=False)
         dom_text = state.dom_state.llm_representation() if state.dom_state else ""
+        max_chars = safety.max_extract_chars
         return ActionResult(
-            extracted_content=f"DOM content for extraction query '{query}':\n{dom_text[:8000]}",
+            extracted_content=f"DOM content for extraction query '{query}':\n{dom_text[:max_chars]}",
             include_in_memory=True,
         )
 
@@ -151,6 +155,11 @@ def build_tools(safety: SafetyLayer) -> Tools:
         param_model=DoneParams,
     )
     async def done(params: DoneParams, browser_session: BrowserSession) -> ActionResult:
+        decision = await safety.guard(
+            PendingAction(name="done", params={"result": params.result})
+        )
+        if not decision.allow:
+            return _blocked(decision.reason)
         return ActionResult(
             extracted_content=params.result,
             is_done=True,

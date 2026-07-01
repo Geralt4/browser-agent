@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from browser_agent.config import Config
@@ -10,6 +11,8 @@ from browser_agent.safety.types import PendingAction, SafetyDecision
 
 if TYPE_CHECKING:
     from browser_use.llm.base import BaseChatModel
+
+_log = logging.getLogger(__name__)
 
 
 class SafetyLayer:
@@ -41,9 +44,16 @@ class SafetyLayer:
         """
         return self._gate
 
+    @property
+    def max_extract_chars(self) -> int:
+        """Maximum characters of DOM content returned by the extract tool."""
+        return self._cfg.max_extract_chars
+
     async def guard(self, action: PendingAction) -> SafetyDecision:
         if self._cfg.kill_switch:
-            return SafetyDecision(allow=False, reason="kill switch engaged")
+            decision = SafetyDecision(allow=False, reason="kill switch engaged")
+            _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
+            return decision
 
         if action.name == "navigate":
             verdict = check_navigation(
@@ -52,16 +62,23 @@ class SafetyLayer:
                 self._cfg.block_hosts,
             )
             if verdict is not None:
+                _log.info("guard action=%s allow=%s reason=%r", action.name, verdict.allow, verdict.reason)
                 return verdict
 
         if is_sensitive(action):
-            return await self._gate.confirm(action)
+            decision = await self._gate.confirm(action)
+            _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
+            return decision
 
         if (
             self._cfg.sensitivity_llm
             and self._chat_model is not None
             and await classify_sensitive_llm(action, self._chat_model)
         ):
-            return await self._gate.confirm(action)
+            decision = await self._gate.confirm(action)
+            _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
+            return decision
 
-        return SafetyDecision(allow=True, reason="not sensitive")
+        decision = SafetyDecision(allow=True, reason="not sensitive")
+        _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
+        return decision

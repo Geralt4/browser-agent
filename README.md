@@ -36,7 +36,7 @@ All knobs are env vars (see `.env.example`). Key ones:
 | `LLM_BASE_URL` | — | Base URL for openai provider (blank → api.openai.com) |
 | `HEADLESS` | `true` | Run browser in headless mode |
 | `MAX_STEPS` | `25` | Max agent steps per task |
-| `VISION_MODE` | `auto` | `auto` (heuristic), `dom` (never), or `vision` (always) |
+| `VISION_MODE` | `vision` | `vision` (always), `dom` (never), `auto` (heuristic), or `category` (data-driven) |
 | `VISION_MODELS` | — | Comma-separated vision-capable model names |
 | `ALLOWLIST` | — | Comma-separated host substrings (allow) |
 | `BLOCKLIST` | — | Comma-separated host substrings (block) |
@@ -85,7 +85,8 @@ src/browser_agent/
 
 ```bash
 uv run ruff check .          # lint
-uv run pytest                # test (no typecheck step)
+npx --yes pyright@1.1.410     # typecheck (matches CI)
+uv run pytest                # test
 ```
 
 See `AGENTS.md` for gotchas and conventions.

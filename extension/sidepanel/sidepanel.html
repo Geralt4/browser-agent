@@ -9,16 +9,16 @@
 
 <header class="topbar">
   <h1>Browser Agent</h1>
-  <nav class="tabs">
-    <button class="tab active" data-tab="chat">Chat</button>
-    <button class="tab" data-tab="settings">Settings</button>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="chat" role="tab" aria-selected="true" aria-controls="tab-chat">Chat</button>
+    <button class="tab" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings">Settings</button>
   </nav>
 </header>
 
 <main>
 
   <!-- ============== CHAT TAB ============== -->
-  <section id="tab-chat" class="tab-pane active">
+  <section id="tab-chat" class="tab-pane active" role="tabpanel" aria-labelledby="tab-chat">
     <div id="connection-warning" class="warning hidden">
       <strong>Backend not reachable.</strong> Make sure the browser-agent server is running
       (e.g. <code>browser-agent-ui</code>).
@@ -40,7 +40,7 @@
   </section>
 
   <!-- ============== SETTINGS TAB ============== -->
-  <section id="tab-settings" class="tab-pane">
+  <section id="tab-settings" class="tab-pane" role="tabpanel" aria-labelledby="tab-settings">
     <form id="settings-form" class="form" autocomplete="off">
 
       <div class="form-section">
@@ -89,6 +89,7 @@
           <option value="auto">Auto — per-task heuristic</option>
           <option value="dom">DOM-only — never use vision</option>
           <option value="vision">Always use vision</option>
+          <option value="category">Category — data-driven routing</option>
         </select>
 
         <label for="vision-models">Vision-capable Models</label>
@@ -109,9 +110,9 @@
 </main>
 
 <!-- gate modal (re-used by the chat tab) -->
-<div id="gate-overlay" class="overlay">
+<div id="gate-overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="gate-heading">
   <div class="modal">
-    <h2>Sensitive Action Requires Approval</h2>
+    <h2 id="gate-heading">Sensitive Action Requires Approval</h2>
     <dl class="action-detail" id="gate-detail"></dl>
     <div class="modal-actions">
       <button class="btn btn--danger" id="gate-deny">Deny</button>
