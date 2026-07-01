@@ -194,6 +194,7 @@
     const gateDetail = document.getElementById('gate-detail');
     let eventSource = null;
     let currentGateId = null;
+    let taskRunning = false; // re-entrancy guard for sendTask
 
     function appendMsg(cls, html) {
       const div = document.createElement('div');
@@ -204,8 +205,10 @@
     }
 
     function sendTask() {
+      if (taskRunning) return; // guard against re-entrant calls
       const task = input.value.trim();
       if (!task) return;
+      taskRunning = true;
       input.disabled = true;
       btn.disabled = true;
       stream.innerHTML = '';
@@ -221,10 +224,17 @@
       .then(data => {
         eventSource = new EventSource('/api/task/' + data.task_id + '/stream');
         eventSource.onmessage = function(e) {
+          // A real event arrived — clear the reconnecting flag if set
+          if (eventSource && eventSource._reconnectingShown) {
+            eventSource._reconnectingShown = false;
+          }
           const msg = JSON.parse(e.data);
           if (msg.type === 'start') {
             stream.innerHTML = '';
             appendMsg('msg--system', msg.message);
+          } else if (msg.type === 'system') {
+            // Vision nudge and other system messages from the server
+            appendMsg('msg--system', esc(msg.message));
           } else if (msg.type === 'step') {
             let html = '<div class="step-header"><span class="step-badge">Step ' + msg.step_n + '</span>';
             if (msg.next_subgoal) html += '<span class="step-label">Next: ' + esc(msg.next_subgoal) + '</span>';
@@ -252,6 +262,16 @@
           }
         };
         eventSource.onerror = function() {
+          if (!eventSource) return; // already cleaned up by done/error handler
+          // CONNECTING (0) = EventSource is auto-retrying; don't kill the view
+          // CLOSED (2) = the connection is truly gone; show "Connection lost"
+          if (eventSource.readyState === EventSource.CONNECTING) {
+            if (!eventSource._reconnectingShown) {
+              eventSource._reconnectingShown = true;
+              appendMsg('msg--system', 'Reconnecting…');
+            }
+            return;
+          }
           appendMsg('msg--error', 'Connection lost');
           resetUI();
         };
@@ -267,13 +287,22 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ gate_id: currentGateId })
-      }).then(function() {
+      }).then(function(r) {
+        if (r.status === 404) {
+          // Gate already expired server-side (300s timeout, see safety/gate.py).
+          appendMsg('msg--error', 'This gate has expired — the task may have timed out.');
+        }
         overlay.classList.remove('open');
         currentGateId = null;
+      }).catch(function(e) {
+        // Network error: keep the overlay open so the user can retry.
+        appendMsg('msg--error', 'Could not reach server: ' + esc(e.message));
       });
     }
 
     function resetUI() {
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      taskRunning = false;
       input.disabled = false;
       btn.disabled = false;
       input.focus();
