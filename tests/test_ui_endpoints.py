@@ -339,6 +339,160 @@ class TestTaskWithOverrides:
         assert "required" in r.json()["error"]
 
     def test_unknown_provider(self, client, env_backup):
-        r = client.post("/api/task", json={"task": "do something", "provider": "nope"})
+        r = client.post(
+            "/api/task",
+            json={"task": "do something", "provider": "nope"},
+        )
         assert r.status_code == 400
         assert "Unknown provider" in r.json()["error"]
+
+    def test_task_without_token_when_unset_succeeds(self, client, env_backup):
+        """When BROWSER_AGENT_API_TOKEN is not configured, /api/task is
+        open (fail-open) so the extension works out of the box."""
+        r = client.post("/api/task", json={"task": "test"})
+        # Will get 400 (unknown provider) or 200 — the point is NOT 401.
+        assert r.status_code != 401
+
+    def test_task_with_token_when_set_requires_auth(self, client, authed_env):
+        """When BROWSER_AGENT_API_TOKEN is configured, /api/task requires
+        X-Auth-Token. Without it, the request is rejected with 401."""
+        r = client.post("/api/task", json={"task": "test"})
+        assert r.status_code == 401
+        assert "X-Auth-Token" in r.json()["detail"]
+
+    def test_task_with_correct_token_passes_auth(self, client, authed_env):
+        """With the correct X-Auth-Token, the request passes auth and
+        proceeds to normal validation."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        # Should NOT be 401 — it gets to the provider validation step
+        assert r.status_code != 401
+
+    def test_task_with_wrong_token_rejected(self, client, authed_env):
+        r = client.post(
+            "/api/task",
+            json={"task": "test"},
+            headers={"X-Auth-Token": "wrong"},
+        )
+        assert r.status_code == 401
+        assert "invalid" in r.json()["detail"]
+
+
+class TestKeychainEndpoints:
+    """The keychain proxy endpoints replace native messaging as the primary
+    keychain bridge for the extension. They run in the local API server
+    (same process as the task runner) and have direct access to the OS
+    keychain via the `keyring` library.
+
+    Security model: these endpoints are intentionally UNAUTHENTICATED.
+    The server is bound to 127.0.0.1 (localhost only), and the `service`
+    and `key` params are validated against a tight allowlist. Requiring
+    X-Auth-Token would break the extension (which can't read .env) and
+    force the API key into chrome.storage.local (plaintext on disk).
+    """
+
+    @pytest.fixture
+    def unique_key(self):
+        import uuid
+        return f"test-key-{uuid.uuid4().hex[:12]}"
+
+    def test_ping_returns_ok(self, client, authed_env):
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "pong": True}
+
+    def test_ping_without_token_succeeds(self, client, authed_env):
+        """Keychain endpoints must work WITHOUT X-Auth-Token — the extension
+        has no way to obtain the token, so requiring it would break the
+        keychain bridge and force plaintext storage."""
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 200
+
+    def test_ping_without_configured_token_succeeds(self, client, env_backup):
+        """Even with no BROWSER_AGENT_API_TOKEN configured, keychain ping
+        must succeed — the keychain bridge is not gated on auth."""
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "pong": True}
+
+    def test_set_get_delete_roundtrip(self, client, authed_env, unique_key):
+        import uuid
+        value = f"value-{uuid.uuid4().hex}"
+
+        # set (no auth header)
+        r = client.post(
+            "/api/keychain/set",
+            json={"service": "browser-agent-test", "key": unique_key, "value": value},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+        # get
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent-test", "key": unique_key},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "value": value}
+
+        # delete
+        r = client.post(
+            "/api/keychain/delete",
+            json={"service": "browser-agent-test", "key": unique_key},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+        # get after delete -> value is None
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent-test", "key": unique_key},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "value": None}
+
+    def test_delete_missing_key_is_idempotent(self, client, authed_env, unique_key):
+        """Deleting a key that doesn't exist must not raise — matches the
+        native host's behavior in native_host.py so the client can call
+        delete without checking presence first."""
+        r = client.post(
+            "/api/keychain/delete",
+            json={"service": "browser-agent-test", "key": unique_key},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+    def test_rejects_unknown_service(self, client, authed_env):
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "not-our-service", "key": "anything"},
+        )
+        assert r.status_code == 400
+        assert "unknown service" in r.json()["detail"]
+
+    def test_rejects_invalid_key_empty(self, client, authed_env):
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent", "key": ""},
+        )
+        assert r.status_code == 400
+        assert "invalid key" in r.json()["detail"]
+
+    def test_rejects_invalid_key_chars(self, client, authed_env):
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent", "key": "has spaces and !"},
+        )
+        assert r.status_code == 400
+        assert "invalid key" in r.json()["detail"]
+
+    def test_rejects_oversized_key(self, client, authed_env):
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent", "key": "a" * 200},
+        )
+        assert r.status_code == 400
+        assert "invalid key" in r.json()["detail"]

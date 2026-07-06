@@ -231,7 +231,7 @@
           const msg = JSON.parse(e.data);
           if (msg.type === 'start') {
             stream.innerHTML = '';
-            appendMsg('msg--system', msg.message);
+            appendMsg('msg--system', esc(msg.message));
           } else if (msg.type === 'system') {
             // Vision nudge and other system messages from the server
             appendMsg('msg--system', esc(msg.message));

@@ -24,8 +24,9 @@
       (e.g. <code>browser-agent-ui</code>).
     </div>
     <div id="storage-warning" class="warning hidden">
-      <strong>API keys stored in chrome.storage.local (less secure).</strong>
-      Install the native messaging host for OS keychain encryption. See the
+      <strong>No keychain bridge available — API keys cannot be saved.</strong>
+      Start the browser-agent server, or install the native messaging host
+      for OS keychain storage. See the
       <code>extension/native_host/</code> directory.
     </div>
     <div id="stream" class="stream">
@@ -63,6 +64,10 @@
           <button type="button" id="toggle-key" class="btn btn--ghost">Show</button>
         </div>
         <p class="hint" id="api-key-hint">Stored in your OS keychain via the native host.</p>
+
+        <label for="auth-token">Server Auth Token <span class="hint">(optional)</span></label>
+        <input id="auth-token" type="password" placeholder="••••••••">
+        <p class="hint">If you set BROWSER_AGENT_API_TOKEN in .env, enter it here so the extension can submit tasks. Stored in chrome.storage.sync (synced settings).</p>
 
         <label for="model">Model</label>
         <div class="row">

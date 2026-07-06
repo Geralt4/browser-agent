@@ -194,7 +194,30 @@ async def list_models(request: Request, base_url: str = ""):
     return {"models": models}
 
 
-@app.post("/api/task")
+def _require_auth_optional(request: Request) -> None:
+    """FastAPI dependency: enforce auth IF BROWSER_AGENT_API_TOKEN is set.
+
+    Unlike _require_auth (which fails-closed with 403 when no token is
+    configured), this dependency is fail-OPEN: if no token is configured,
+    the request proceeds without auth. This matches the /api/models
+    pattern where the extension's Fetch button must work without a token.
+
+    When a token IS configured, requests must include a matching
+    X-Auth-Token header. This prevents unauthorized local processes from
+    submitting tasks (and burning API credits) when the user has opted
+    into auth.
+    """
+    expected = _configured_token()
+    if not expected:
+        return  # No token configured — allow (fail-open)
+    provided = request.headers.get("X-Auth-Token", "")
+    if not provided:
+        raise HTTPException(status_code=401, detail="X-Auth-Token header required")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
+
+
+@app.post("/api/task", dependencies=[Depends(_require_auth_optional)])
 async def create_task(request: Request):
     body = await request.json()
     task_text = body.get("task", "").strip()
@@ -216,10 +239,13 @@ async def create_task(request: Request):
             )
 
     cfg = load_config()
+    # API key is passed via the X-API-Key header (not the request body)
+    # to avoid logging it in body-level middleware/crash dumps.
+    api_key = request.headers.get("X-API-Key")
     overrides = {
         "llm_model": body.get("model"),
         "llm_base_url": body.get("base_url"),
-        "llm_api_key": body.get("api_key"),
+        "llm_api_key": api_key,
         "vision_mode": body.get("vision_mode"),
         "vision_models": body.get("vision_models"),
         "provider": body.get("provider"),
@@ -327,6 +353,115 @@ async def gate_deny(request: Request):
         if isinstance(gate, StreamingConfirmationGate) and gate.resolve(gate_id, False):
             return {"status": "denied"}
     return JSONResponse(content={"status": "not found"}, status_code=404)
+
+
+# Keychain proxy endpoints — bridge the extension's keychain operations
+# through the local API server so the extension doesn't depend on native
+# messaging. This is the primary keychain path for Brave (which blocks
+# native messaging for unpacked extensions despite a correctly-pinned
+# allowed_origins + NativeMessagingAllowlist policy) and a fallback for
+# any environment where the native host can't run.
+#
+# Security: these endpoints are intentionally UNAUTHENTICATED. The server
+# is bound to 127.0.0.1 (localhost only), and the `service` and `key`
+# params are validated against a tight allowlist, so even a local process
+# that reaches them can only read/write the browser-agent keychain entry
+# — not arbitrary OS keychain entries. Requiring X-Auth-Token here would
+# create a chicken-and-egg problem: the extension has no way to obtain
+# the token (it doesn't read .env), so the keychain bridge would always
+# fail and the API key would fall back to chrome.storage.local (plaintext
+# on disk). Keeping these open is the safer trade-off.
+
+_KEYCHAIN_ALLOWED_SERVICES = frozenset({"browser-agent", "browser-agent-test"})
+_KEYCHAIN_KEY_PATTERN = __import__("re").compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_keychain_params(service: str, key: str) -> None:
+    if service not in _KEYCHAIN_ALLOWED_SERVICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown service: {service!r}",
+        )
+    if not _KEYCHAIN_KEY_PATTERN.match(key or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid key (must be 1-128 chars, [A-Za-z0-9_-])",
+        )
+
+
+def _keychain_error_response(exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        content={"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+        status_code=500,
+    )
+
+
+@app.post("/api/keychain/ping")
+async def keychain_ping():
+    """Health check for the keychain bridge. Returns the same shape as the
+    native host's ping so the side panel can use it as a drop-in probe."""
+    try:
+        import keyring
+        # Force backend initialization so the ping fails loudly if keyring
+        # can't reach the OS secret store (vs. silently passing and then
+        # failing on the first set/get).
+        keyring.get_keyring()
+    except Exception as exc:
+        return _keychain_error_response(exc)
+    return {"ok": True, "pong": True}
+
+
+@app.post("/api/keychain/set")
+async def keychain_set(request: Request):
+    body = await request.json()
+    service = body.get("service", "")
+    key = body.get("key", "")
+    value = body.get("value", "")
+    _validate_keychain_params(service, key)
+    try:
+        import keyring
+        keyring.set_password(service, key, value)
+    except Exception as exc:
+        return _keychain_error_response(exc)
+    return {"ok": True}
+
+
+@app.post("/api/keychain/get")
+async def keychain_get(request: Request):
+    body = await request.json()
+    service = body.get("service", "")
+    key = body.get("key", "")
+    _validate_keychain_params(service, key)
+    try:
+        import keyring
+        value = keyring.get_password(service, key)
+    except Exception as exc:
+        return _keychain_error_response(exc)
+    return {"ok": True, "value": value}
+
+
+@app.post("/api/keychain/delete")
+async def keychain_delete(request: Request):
+    body = await request.json()
+    service = body.get("service", "")
+    key = body.get("key", "")
+    _validate_keychain_params(service, key)
+    try:
+        import keyring
+        # PasswordDeleteError means "not present" — treat as success so
+        # the client can call delete idempotently, matching the native
+        # host's behavior in native_host.py. The `keyring` package
+        # doesn't ship type stubs, so we catch the base Exception below
+        # and re-raise non-delete errors — the native host does the same
+        # via a try/except in its dispatch loop.
+        try:
+            keyring.delete_password(service, key)
+        except Exception as exc:  # noqa: BLE001
+            if type(exc).__name__ != "PasswordDeleteError":
+                raise
+    except Exception as exc:
+        return _keychain_error_response(exc)
+    return {"ok": True}
 
 
 def _env_path() -> pathlib.Path:

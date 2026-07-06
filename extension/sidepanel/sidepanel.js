@@ -1,6 +1,6 @@
 // Side panel logic for Browser Agent.
 // - Tabs: Chat + Settings
-// - Settings: API key via native host (OS keychain) with chrome.storage.local fallback
+// - Settings: API key via native host (OS keychain) — plaintext fallback removed
 // - Chat: task submission + SSE streaming + gate modal
 // - Vision nudge: shown when the selected model is not in the vision models list
 
@@ -8,7 +8,6 @@ const API_BASE = "http://127.0.0.1:8000";
 const KEYRING_SERVICE = "browser-agent";
 
 // State
-let nativeAvailable = null; // null = unchecked, true/false after ping
 let currentTaskId = null;
 let eventSource = null;
 let currentGateId = null;
@@ -40,7 +39,44 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// ---------------- native host bridge ----------------
+// ---------------- keychain bridge (API-based, primary) ----------------
+// Primary path: proxy keychain operations through the local API server.
+// This works on Brave (which blocks native messaging for unpacked
+// extensions even when allowed_origins matches and the
+// NativeMessagingAllowlist policy is set) and on Chrome alike. The
+// native host is retained as a fallback for environments where the
+// API server isn't reachable.
+
+let keychainAvailable = null; // null = unchecked, true/false after ping
+let nativeAvailable = null; // legacy native-host probe (set by checkNative)
+
+async function keychainCall(cmd, payload) {
+  const r = await fetch(`${API_BASE}/api/keychain/${cmd}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data && data.error) || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+async function checkKeychain() {
+  try {
+    const resp = await keychainCall("ping");
+    keychainAvailable = resp && resp.ok === true;
+  } catch {
+    keychainAvailable = false;
+  }
+  return keychainAvailable;
+}
+
+// ---------------- native host bridge (legacy fallback) ----------------
+// Only reached if the API keychain bridge is down. Kept for Chrome and
+// other Chromium-based browsers where native messaging works for
+// unpacked extensions.
 async function nativeCall(payload) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage({ kind: "native", payload }, (resp) => {
@@ -79,20 +115,21 @@ function _checkStorageError() {
 async function loadSettings() {
   return new Promise((resolve) => {
     chrome.storage.sync.get(
-      ["provider", "baseUrl", "model", "visionMode", "visionModels"],
+      ["provider", "baseUrl", "model", "visionMode", "visionModels", "authToken"],
       (sync) => {
-        try { _checkStorageError(); } catch (e) { resolve({ provider: "openai", baseUrl: "", model: "", visionMode: "vision", visionModels: "", apiKey: "", usingLocalFallback: false }); return; }
-        chrome.storage.local.get(["apiKey", "usingLocalFallback"], (local) => {
-          try { _checkStorageError(); } catch (e) { resolve({ provider: sync.provider || "openai", baseUrl: sync.baseUrl || "", model: sync.model || "", visionMode: sync.visionMode || "vision", visionModels: sync.visionModels || "", apiKey: "", usingLocalFallback: false }); return; }
-          resolve({
-            provider: sync.provider || "openai",
-            baseUrl: sync.baseUrl || "",
-            model: sync.model || "",
-            visionMode: sync.visionMode || "vision",
-            visionModels: sync.visionModels || "",
-            apiKey: local.apiKey || "",
-            usingLocalFallback: !!local.usingLocalFallback,
-          });
+        try { _checkStorageError(); } catch (e) { resolve({ provider: "openai", baseUrl: "", model: "", visionMode: "vision", visionModels: "", apiKey: "", usingLocalFallback: false, authToken: "" }); return; }
+        // apiKey is no longer stored in chrome.storage.local (the plaintext
+        // fallback was removed). It's loaded from the OS keychain in init()
+        // via loadApiKey(). usingLocalFallback is always false now.
+        resolve({
+          provider: sync.provider || "openai",
+          baseUrl: sync.baseUrl || "",
+          model: sync.model || "",
+          visionMode: sync.visionMode || "vision",
+          visionModels: sync.visionModels || "",
+          apiKey: "",
+          usingLocalFallback: false,
+          authToken: sync.authToken || "",
         });
       }
     );
@@ -112,6 +149,7 @@ async function saveSettings(s) {
         model: s.model,
         visionMode: s.visionMode,
         visionModels: s.visionModels,
+        authToken: s.authToken || "",
       },
       () => {
         try { _checkStorageError(); resolve(); } catch (e) { reject(e); }
@@ -122,40 +160,64 @@ async function saveSettings(s) {
 
 async function storeApiKey(key) {
   if (!key) {
-    if (nativeAvailable) {
+    if (keychainAvailable) {
+      try { await keychainCall("delete", { service: KEYRING_SERVICE, key: "llm_api_key" }); }
+      catch {}
+    } else if (await checkNative()) {
       try { await nativeCall({ cmd: "delete_key", service: KEYRING_SERVICE, key: "llm_api_key" }); }
       catch {}
     }
     await new Promise((r) => chrome.storage.local.remove("apiKey", () => { try { _checkStorageError(); } catch {} r(); }));
     return;
   }
-  if (nativeAvailable) {
+  if (keychainAvailable) {
+    try {
+      await keychainCall("set", { service: KEYRING_SERVICE, key: "llm_api_key", value: key });
+      await new Promise((r) => chrome.storage.local.remove(["apiKey", "usingLocalFallback"], () => { try { _checkStorageError(); } catch {} r(); }));
+      return;
+    } catch {
+      // fall through to native host
+    }
+  }
+  if (await checkNative()) {
     try {
       await nativeCall({ cmd: "set_key", service: KEYRING_SERVICE, key: "llm_api_key", value: key });
       await new Promise((r) => chrome.storage.local.remove(["apiKey", "usingLocalFallback"], () => { try { _checkStorageError(); } catch {} r(); }));
       return;
-    } catch (e) {
+    } catch {
       // fall through to local fallback
     }
   }
-  // local fallback (less secure, but functional)
-  await new Promise((r) =>
-    chrome.storage.local.set({ apiKey: key, usingLocalFallback: true }, () => { try { _checkStorageError(); } catch {} r(); })
+  // No keychain bridge available — refuse to store the key unencrypted.
+  // chrome.storage.local is plaintext on disk and readable by any process
+  // with filesystem access. Show a hard error so the user knows the key
+  // was NOT saved, rather than silently storing it insecurely.
+  throw new Error(
+    "Cannot save API key: no keychain bridge available. " +
+    "Start the browser-agent server, or install the native messaging host " +
+    "for OS keychain storage. The key was NOT saved to chrome.storage.local " +
+    "(refused: plaintext storage is disabled)."
   );
 }
 
 async function loadApiKey() {
-  if (nativeAvailable) {
+  if (keychainAvailable) {
+    try {
+      const resp = await keychainCall("get", { service: KEYRING_SERVICE, key: "llm_api_key" });
+      if (resp && resp.ok && resp.value) return { key: resp.value, fromLocal: false };
+    } catch {}
+  }
+  if (await checkNative()) {
     try {
       const resp = await nativeCall({ cmd: "get_key", service: KEYRING_SERVICE, key: "llm_api_key" });
       if (resp && resp.ok && resp.value) return { key: resp.value, fromLocal: false };
     } catch {}
   }
-  const local = await new Promise((r) => chrome.storage.local.get("apiKey", (data) => {
-    try { _checkStorageError(); } catch { r({}); return; }
-    r(data);
-  }));
-  return { key: local.apiKey || "", fromLocal: !!local.apiKey };
+  // No keychain bridge available — do NOT fall back to chrome.storage.local.
+  // Reading plaintext storage would return a key that was stored insecurely
+  // (by the old fallback path, now removed). Return empty so the user is
+  // prompted to re-enter the key into the secure keychain bridge.
+  return { key: "", fromLocal: false };
 }
 
 // ---------------- settings form ----------------
@@ -178,6 +240,7 @@ function fillSettings(s) {
   $("vision-mode").value = s.visionMode;
   $("vision-models").value = s.visionModels;
   $("api-key").value = s.apiKey || ""; // pre-fill if stored locally
+  $("auth-token").value = s.authToken || "";
   updateVisionNudge();
 }
 
@@ -189,6 +252,7 @@ function readSettings() {
     visionMode: $("vision-mode").value,
     visionModels: $("vision-models").value.trim(),
     apiKey: $("api-key").value.trim(),
+    authToken: $("auth-token").value.trim(),
   };
 }
 
@@ -326,13 +390,16 @@ async function sendTask() {
   try {
     const r = await fetch(`${API_BASE}/api/task`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": savedConfig.apiKey,
+        ...(savedConfig.authToken ? { "X-Auth-Token": savedConfig.authToken } : {}),
+      },
       body: JSON.stringify({
         task,
         provider: savedConfig.provider,
         base_url: savedConfig.baseUrl || null,
         model: savedConfig.model,
-        api_key: savedConfig.apiKey,
         vision_mode: savedConfig.visionMode,
         vision_models: savedConfig.visionModels || null,
       }),
@@ -455,13 +522,18 @@ async function resolveGate(approved) {
 
 // ---------------- init ----------------
 async function init() {
-  await checkNative();
+  // Primary: try the API-based keychain bridge (works on Brave + Chrome).
+  // Fallback: probe the native host if the API bridge is down. The
+  // storeApiKey/loadApiKey path checks each one inline so a later state
+  // change (e.g. server restart) is picked up on the next save/load.
+  await checkKeychain();
+  if (!keychainAvailable) await checkNative();
   savedConfig = await loadSettings();
 
   // If the saved config has no model, try to pre-fill the API key from the
-  // native host (the user may have entered it before but it's only in the
-  // OS keychain, not in chrome.storage.local).
-  if (nativeAvailable && !savedConfig.apiKey) {
+  // keychain bridge (the user may have entered it before but it's only in
+  // the OS keychain, not in chrome.storage.local).
+  if (!savedConfig.apiKey) {
     const k = await loadApiKey();
     if (k.key) {
       savedConfig.apiKey = k.key;
@@ -471,10 +543,13 @@ async function init() {
 
   fillSettings(savedConfig);
 
-  if (!nativeAvailable) {
+  if (!keychainAvailable && !nativeAvailable) {
     $("storage-warning").classList.remove("hidden");
     $("api-key-hint").textContent =
-      "Native host unavailable. API key will be stored in chrome.storage.local (less secure).";
+      "No keychain bridge available. Start the server or install the native host. API keys cannot be saved without OS keychain storage.";
+  } else if (keychainAvailable) {
+    $("api-key-hint").textContent =
+      "Stored in your OS keychain via the local API server.";
   } else {
     $("api-key-hint").textContent =
       "Stored in your OS keychain via the native messaging host.";

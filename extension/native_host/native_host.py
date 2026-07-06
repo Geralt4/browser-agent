@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/giannismanologlou/Documents/Browser-agent/.venv/bin/python3
 """Chrome native messaging host for browser-agent.
 
 This is a tiny stdio proxy between the Chrome extension and the OS keychain.
@@ -25,12 +25,28 @@ https://developer.chrome.com/docs/apps/nativeMessaging/#native-messaging-host
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 
 # Chrome's native messaging limit. A hostile extension could otherwise send
 # a length prefix of 0xFFFFFFFF and cause a 4 GB allocation attempt.
 MAX_MESSAGE_SIZE = 1024 * 1024
+
+# Security: validate the `service` and `key` params against a tight
+# allowlist so a compromised extension can't write arbitrary entries
+# into the OS keychain. Mirrors the server-side validation in server.py.
+_ALLOWED_SERVICES = frozenset({"browser-agent", "browser-agent-test"})
+_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_keychain_params(service: str, key: str) -> str | None:
+    """Return an error string if params are invalid, None if OK."""
+    if service not in _ALLOWED_SERVICES:
+        return f"unknown service: {service!r}"
+    if not _KEY_PATTERN.match(key or ""):
+        return "invalid key (must be 1-128 chars, [A-Za-z0-9_-])"
+    return None
 
 
 def main() -> int:
@@ -88,16 +104,32 @@ def main() -> int:
                 if cmd == "ping":
                     send({"ok": True, "pong": True, "_id": _id})
                 elif cmd == "set_key":
-                    keyring.set_password(
-                        msg["service"], msg["key"], msg["value"]
-                    )
+                    service = msg.get("service", "")
+                    key = msg.get("key", "")
+                    err = _validate_keychain_params(service, key)
+                    if err:
+                        send({"ok": False, "error": err, "_id": _id})
+                        continue
+                    keyring.set_password(service, key, msg["value"])
                     send({"ok": True, "_id": _id})
                 elif cmd == "get_key":
-                    value = keyring.get_password(msg["service"], msg["key"])
+                    service = msg.get("service", "")
+                    key = msg.get("key", "")
+                    err = _validate_keychain_params(service, key)
+                    if err:
+                        send({"ok": False, "error": err, "_id": _id})
+                        continue
+                    value = keyring.get_password(service, key)
                     send({"ok": True, "value": value, "_id": _id})
                 elif cmd == "delete_key":
+                    service = msg.get("service", "")
+                    key = msg.get("key", "")
+                    err = _validate_keychain_params(service, key)
+                    if err:
+                        send({"ok": False, "error": err, "_id": _id})
+                        continue
                     try:
-                        keyring.delete_password(msg["service"], msg["key"])
+                        keyring.delete_password(service, key)
                     except keyring.errors.PasswordDeleteError:
                         pass
                     send({"ok": True, "_id": _id})

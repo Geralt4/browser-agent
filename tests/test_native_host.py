@@ -106,6 +106,31 @@ class TestNativeHost:
         r = _run_host([{"cmd": "delete_key", "service": service, "key": key}])
         assert r[0] == {"ok": True, "_id": None}
 
+    def test_rejects_unknown_service(self):
+        """A compromised extension must not be able to write to arbitrary
+        keychain services — only browser-agent / browser-agent-test are allowed."""
+        key = _make_unique_key("evil")
+        r = _run_host([
+            {"cmd": "set_key", "service": "evil-corp", "key": key, "value": "stolen"},
+        ])
+        assert r[0]["ok"] is False
+        assert "unknown service" in r[0]["error"]
+
+    def test_rejects_invalid_key_chars(self):
+        """Keys with spaces or special chars must be rejected."""
+        r = _run_host([
+            {"cmd": "get_key", "service": "browser-agent", "key": "has spaces!"},
+        ])
+        assert r[0]["ok"] is False
+        assert "invalid key" in r[0]["error"]
+
+    def test_rejects_empty_key(self):
+        r = _run_host([
+            {"cmd": "get_key", "service": "browser-agent", "key": ""},
+        ])
+        assert r[0]["ok"] is False
+        assert "invalid key" in r[0]["error"]
+
     def test_invalid_json(self):
         proc = subprocess.Popen(
             [sys.executable, str(HOST)],
@@ -175,3 +200,192 @@ class TestNativeHost:
         finally:
             if proc.poll() is None:
                 proc.kill()
+
+
+NATIVE_HOST_DIR = HOST.parent
+TEMPLATE = NATIVE_HOST_DIR / "com.browseragent.json.template"
+INSTALL_SH = NATIVE_HOST_DIR / "install.sh"
+
+
+def _read_template_name() -> str:
+    """Pull the `name` field out of the template without running the script."""
+    data = json.loads(TEMPLATE.read_text())
+    return data["name"]
+
+
+class TestInstallManifest:
+    """Regression tests for install.sh's manifest filename.
+
+    Chromium discovers native messaging hosts by looking for a file named
+    <name>.json in the NativeMessagingHosts directory. If the filename
+    doesn't match the host's `name` field, every connectNative() call fails
+    with "Specified native messaging host not found" and the keychain
+    bridge silently degrades to chrome.storage.local.
+    """
+
+    def test_generated_manifest_filename_matches_name_field(self):
+        """The manifest file the script produces must be named <name>.json.
+
+        install.sh writes the rendered manifest to FINAL=.../<name>.json.
+        If anyone changes the script's `name` field but forgets to update
+        FINAL (or vice versa), Chromium silently fails to discover the
+        host. This guard runs install.sh in an isolated temp dir and
+        inspects what it produced.
+        """
+        import shutil
+        import tempfile
+
+        if not INSTALL_SH.exists():
+            pytest.skip(f"install.sh not present at {INSTALL_SH}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # Mirror the directory layout the script expects: native_host.py,
+            # the template, and a writable output dir. We don't need a
+            # working ${HOME}/Library/... path because we never run the
+            # platform-specific TARGET_DIR branch (Linux is fine here).
+            staging = tmp_path / "staging"
+            staging.mkdir()
+            shutil.copy(HOST, staging / "native_host.py")
+            shutil.copy(TEMPLATE, staging / "com.browseragent.json.template")
+            script = staging / "install.sh"
+            shutil.copy(INSTALL_SH, script)
+            script.chmod(0o755)
+
+            # We can't easily redirect the macOS / Linux TARGET_DIRs without
+            # editing the script, so we only verify the on-disk FINAL the
+            # script wrote. That file is what install.sh *also* copies into
+            # the per-platform directory.
+            result = subprocess.run(
+                [str(script), "test-extension-id-12345678901234567890"],
+                capture_output=True, text=True, timeout=30,
+            )
+            # The script's Darwin/Linux branches both `cp "${FINAL}"
+            # "${TARGET_DIR}/..."` and will succeed on macOS / Linux
+            # test hosts. On macOS it copies into the user's Brave/Chrome
+            # NativeMessagingHosts dir — harmless, idempotent. We don't
+            # assert the cp succeeded; we only inspect the FINAL file the
+            # script always writes regardless of platform.
+            assert result.returncode == 0, (
+                f"install.sh failed: stdout={result.stdout!r} "
+                f"stderr={result.stderr!r}"
+            )
+
+            final = staging / "com.browseragent.native_host.json"
+            assert final.exists(), (
+                f"install.sh did not produce {final.name!r}; "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+
+            data = json.loads(final.read_text())
+            assert data["name"] + ".json" == final.name, (
+                f"manifest filename {final.name!r} does not match the "
+                f"host's `name` field {data['name']!r}; Chromium will fail "
+                f"to discover this host with 'Specified native messaging "
+                f"host not found'."
+            )
+            # And the pinned origin must be present and well-formed.
+            assert data["allowed_origins"] == [
+                "chrome-extension://test-extension-id-12345678901234567890/"
+            ]
+
+    def test_install_sh_final_uses_host_name_filename(self):
+        """Belt-and-braces: assert the script's own FINAL variable name
+        ends in <name>.json, so an edit that renames the host without
+        updating FINAL fails this test."""
+        if not INSTALL_SH.exists():
+            pytest.skip(f"install.sh not present at {INSTALL_SH}")
+
+        source = INSTALL_SH.read_text()
+        name = _read_template_name()
+        # FINAL is set on a single line; the basename must be <name>.json.
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("FINAL="):
+                final_path = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                basename = final_path.rsplit("/", 1)[-1]
+                assert basename == name + ".json", (
+                    f"FINAL basename is {basename!r} but host name is "
+                    f"{name!r}; install.sh would produce a manifest "
+                    f"Chromium cannot discover."
+                )
+                return
+        pytest.fail("could not find FINAL= assignment in install.sh")
+
+
+class TestBraveNativeMessagingPolicy:
+    """Brave requires an explicit enterprise policy to permit unpacked dev
+    extensions to use native messaging. Without it, connectNative() returns
+    'Access to the specified native messaging host is forbidden' even when
+    the host's `allowed_origins` matches the extension ID byte-for-byte.
+
+    The fix is a managed-preferences plist at:
+        ~/Library/Managed Preferences/com.brave.Browser.plist
+    setting NativeMessagingAllowlist (with the extension ID) and
+    NativeMessagingUserLevelHosts (true).
+
+    This test asserts the plist is present, valid, and well-formed. It
+    only runs on macOS and only when the plist exists — so a developer
+    without Brave (or running on CI) is not broken.
+    """
+
+    PLIST_PATH = Path.home() / "Library/Managed Preferences" / "com.brave.Browser.plist"
+
+    def _require_plist(self):
+        if sys.platform != "darwin":
+            pytest.skip("Brave managed-preferences plist is macOS-specific")
+        if not self.PLIST_PATH.exists():
+            pytest.skip(
+                f"Brave policy plist not present at {self.PLIST_PATH}. "
+                f"If you're live-testing the extension on Brave, see the "
+                f"extension/native_host/ directory for the policy install "
+                f"instructions."
+            )
+
+    def test_plist_is_valid(self):
+        self._require_plist()
+        # plistlib raises on malformed plist; we want any parse error to
+        # fail loudly so a corrupt managed-preferences file is caught at
+        # test time rather than at browser restart.
+        import plistlib
+        data = plistlib.loads(self.PLIST_PATH.read_bytes())
+        assert isinstance(data, dict)
+
+    def test_plist_has_native_messaging_allowlist(self):
+        self._require_plist()
+        import plistlib
+        data = plistlib.loads(self.PLIST_PATH.read_bytes())
+        allowlist = data.get("NativeMessagingAllowlist")
+        assert isinstance(allowlist, list), (
+            f"NativeMessagingAllowlist must be a list, got {type(allowlist).__name__}. "
+            f"Without an allowlist, Brave forbids native messaging for unpacked "
+            f"extensions and connectNative() fails with 'forbidden'."
+        )
+        assert all(isinstance(item, str) and len(item) == 32 for item in allowlist), (
+            f"Each allowlist entry must be a 32-char extension ID; got {allowlist!r}"
+        )
+        assert len(allowlist) > 0, "NativeMessagingAllowlist is empty"
+
+    def test_plist_allows_user_level_hosts(self):
+        self._require_plist()
+        import plistlib
+        data = plistlib.loads(self.PLIST_PATH.read_bytes())
+        assert data.get("NativeMessagingUserLevelHosts") is True, (
+            "NativeMessagingUserLevelHosts must be true. install.sh installs the "
+            "host at ~/Library/.../NativeMessagingHosts/ (the user level); if this "
+            "policy is false or missing, Brave will refuse to load user-level hosts."
+        )
+
+    def test_install_sh_documented_requirement(self):
+        """Belt-and-braces: the install script must mention the Brave policy
+        requirement so future installers don't silently fall back to the
+        'forbidden' failure mode."""
+        if not INSTALL_SH.exists():
+            pytest.skip(f"install.sh not present at {INSTALL_SH}")
+        source = INSTALL_SH.read_text()
+        assert "NativeMessagingAllowlist" in source or "Brave" in source and "policy" in source.lower(), (
+            "install.sh must document the Brave NativeMessagingAllowlist policy "
+            "requirement. Without it, users installing on Brave will see "
+            "'Access to the specified native messaging host is forbidden' and "
+            "the keychain bridge will silently fall back to chrome.storage.local."
+        )
