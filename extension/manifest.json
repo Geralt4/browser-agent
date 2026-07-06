@@ -6,8 +6,7 @@
   "minimum_chrome_version": "114",
   "permissions": [
     "storage",
-    "sidePanel",
-    "nativeMessaging"
+    "sidePanel"
   ],
   "host_permissions": [
     "http://127.0.0.1:8000/*"

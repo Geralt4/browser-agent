@@ -48,7 +48,6 @@ document.addEventListener("keydown", (e) => {
 // API server isn't reachable.
 
 let keychainAvailable = null; // null = unchecked, true/false after ping
-let nativeAvailable = null; // legacy native-host probe (set by checkNative)
 
 async function keychainCall(cmd, payload) {
   const r = await fetch(`${API_BASE}/api/keychain/${cmd}`, {
@@ -71,36 +70,6 @@ async function checkKeychain() {
     keychainAvailable = false;
   }
   return keychainAvailable;
-}
-
-// ---------------- native host bridge (legacy fallback) ----------------
-// Only reached if the API keychain bridge is down. Kept for Chrome and
-// other Chromium-based browsers where native messaging works for
-// unpacked extensions.
-async function nativeCall(payload) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({ kind: "native", payload }, (resp) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      if (!resp || !resp.ok) {
-        reject(new Error((resp && resp.error) || "native call failed"));
-        return;
-      }
-      resolve(resp.response);
-    });
-  });
-}
-
-async function checkNative() {
-  try {
-    const resp = await nativeCall({ cmd: "ping" });
-    nativeAvailable = resp && resp.ok === true;
-  } catch {
-    nativeAvailable = false;
-  }
-  return nativeAvailable;
 }
 
 // ---------------- storage ----------------
@@ -163,9 +132,6 @@ async function storeApiKey(key) {
     if (keychainAvailable) {
       try { await keychainCall("delete", { service: KEYRING_SERVICE, key: "llm_api_key" }); }
       catch {}
-    } else if (await checkNative()) {
-      try { await nativeCall({ cmd: "delete_key", service: KEYRING_SERVICE, key: "llm_api_key" }); }
-      catch {}
     }
     await new Promise((r) => chrome.storage.local.remove("apiKey", () => { try { _checkStorageError(); } catch {} r(); }));
     return;
@@ -176,16 +142,7 @@ async function storeApiKey(key) {
       await new Promise((r) => chrome.storage.local.remove(["apiKey", "usingLocalFallback"], () => { try { _checkStorageError(); } catch {} r(); }));
       return;
     } catch {
-      // fall through to native host
-    }
-  }
-  if (await checkNative()) {
-    try {
-      await nativeCall({ cmd: "set_key", service: KEYRING_SERVICE, key: "llm_api_key", value: key });
-      await new Promise((r) => chrome.storage.local.remove(["apiKey", "usingLocalFallback"], () => { try { _checkStorageError(); } catch {} r(); }));
-      return;
-    } catch {
-      // fall through to local fallback
+      // fall through to error
     }
   }
   // No keychain bridge available — refuse to store the key unencrypted.
@@ -204,12 +161,6 @@ async function loadApiKey() {
   if (keychainAvailable) {
     try {
       const resp = await keychainCall("get", { service: KEYRING_SERVICE, key: "llm_api_key" });
-      if (resp && resp.ok && resp.value) return { key: resp.value, fromLocal: false };
-    } catch {}
-  }
-  if (await checkNative()) {
-    try {
-      const resp = await nativeCall({ cmd: "get_key", service: KEYRING_SERVICE, key: "llm_api_key" });
       if (resp && resp.ok && resp.value) return { key: resp.value, fromLocal: false };
     } catch {}
   }
@@ -522,12 +473,9 @@ async function resolveGate(approved) {
 
 // ---------------- init ----------------
 async function init() {
-  // Primary: try the API-based keychain bridge (works on Brave + Chrome).
-  // Fallback: probe the native host if the API bridge is down. The
-  // storeApiKey/loadApiKey path checks each one inline so a later state
-  // change (e.g. server restart) is picked up on the next save/load.
+  // The API-based keychain bridge is the sole keychain path. It works on
+  // Brave and Chrome alike — no native messaging required.
   await checkKeychain();
-  if (!keychainAvailable) await checkNative();
   savedConfig = await loadSettings();
 
   // If the saved config has no model, try to pre-fill the API key from the
@@ -543,16 +491,13 @@ async function init() {
 
   fillSettings(savedConfig);
 
-  if (!keychainAvailable && !nativeAvailable) {
+  if (!keychainAvailable) {
     $("storage-warning").classList.remove("hidden");
     $("api-key-hint").textContent =
-      "No keychain bridge available. Start the server or install the native host. API keys cannot be saved without OS keychain storage.";
-  } else if (keychainAvailable) {
-    $("api-key-hint").textContent =
-      "Stored in your OS keychain via the local API server.";
+      "No keychain bridge available. Start the browser-agent server. API keys cannot be saved without OS keychain storage.";
   } else {
     $("api-key-hint").textContent =
-      "Stored in your OS keychain via the native messaging host.";
+      "Stored in your OS keychain via the local API server.";
   }
 
   // Probe backend reachability
