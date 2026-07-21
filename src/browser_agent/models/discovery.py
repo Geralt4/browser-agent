@@ -32,17 +32,28 @@ def fetch_models(base_url: str, api_key: str, timeout: float = 10.0) -> list[str
                     f"Provider returned HTTP {resp.status} for {url}"
                 )
             raw = resp.read().decode("utf-8")
+    except TimeoutError as exc:
+        # A bare `TimeoutError` is what urlopen raises when the global
+        # default socket timeout fires; some Python builds or downstream
+        # wrappers (httpx, requests) also raise this directly.
+        raise ModelDiscoveryError(
+            f"Timeout while fetching models from {url}"
+        ) from exc
     except urllib.error.HTTPError as exc:
         raise ModelDiscoveryError(
             f"Provider returned HTTP {exc.code} for {url}"
         ) from exc
     except urllib.error.URLError as exc:
+        # urlopen wraps socket timeouts as URLError(reason=socket.timeout())
+        # on most Python builds, so the TimeoutError branch above is
+        # effectively a fallback. Check the reason here so the user-
+        # facing error message is accurate.
+        if isinstance(exc.reason, TimeoutError):
+            raise ModelDiscoveryError(
+                f"Timeout while fetching models from {url}"
+            ) from exc
         raise ModelDiscoveryError(
             f"Could not reach {url}: {exc.reason}"
-        ) from exc
-    except TimeoutError as exc:
-        raise ModelDiscoveryError(
-            f"Timeout while fetching models from {url}"
         ) from exc
 
     try:
@@ -56,20 +67,29 @@ def fetch_models(base_url: str, api_key: str, timeout: float = 10.0) -> list[str
 
 
 def _normalize_url(base_url: str) -> str:
-    """Normalize base_url: strip trailing slashes, ensure /v1 suffix.
+    """Normalize base_url: strip trailing slashes, ensure exactly one /v1 suffix.
 
     Examples:
-        "https://api.openai.com"     -> "https://api.openai.com/v1"
-        "https://api.openai.com/"    -> "https://api.openai.com/v1"
-        "https://api.openai.com/v1"  -> "https://api.openai.com/v1"
-        "https://api.openai.com/v1/" -> "https://api.openai.com/v1"
+        "https://api.openai.com"      -> "https://api.openai.com/v1"
+        "https://api.openai.com/"     -> "https://api.openai.com/v1"
+        "https://api.openai.com/v1"   -> "https://api.openai.com/v1"
+        "https://api.openai.com/v1/"  -> "https://api.openai.com/v1"
+        "https://api.openai.com/v1/v1" -> "https://api.openai.com/v1"   (deduped)
+        "https://api.openai.com/foo"  -> "https://api.openai.com/foo/v1" (appended)
+        "https://api.openai.com/v1/bar" -> "https://api.openai.com/v1/bar/v1"
+
+    Path-bearing URLs keep their path. A doubled /v1 (e.g. "/v1/v1")
+    collapses to a single /v1 so the same URL normalizes the same
+    regardless of how many times it was duplicated.
     """
     url = (base_url or "").strip().rstrip("/")
     if not url:
         raise ModelDiscoveryError("base_url is required")
-    if not url.endswith("/v1"):
-        url = url + "/v1"
-    return url
+    # Strip all trailing /v1 segments (dedup), then rstrip slashes.
+    while url.endswith("/v1"):
+        url = url[:-3]
+    url = url.rstrip("/")
+    return url + "/v1"
 
 
 def is_allowed_base_url(requested: str | None, configured: str | None) -> bool:

@@ -46,6 +46,101 @@ def test_typing_credit_card_sensitive():
     assert is_sensitive(action) is True
 
 
+def test_typing_credit_card_dashed_sensitive():
+    action = PendingAction(name="type_text", params={"index": 1, "text": "4111-1111-1111-1111"})
+    assert is_sensitive(action) is True
+
+
+def test_typing_credit_card_no_separator_sensitive():
+    action = PendingAction(name="type_text", params={"index": 1, "text": "4111111111111111"})
+    assert is_sensitive(action) is True
+
+
+def test_typing_credit_card_with_trailing_letter_sensitive():
+    r"""Regression: the old regex `(?:\d[ -]?){13,19}` with a trailing \b
+    failed on a card number followed by any word character (e.g. a user
+    pasting 'card: 4111 1111 1111 1111x' as a placeholder). The new regex
+    drops the trailing \b so the card is detected regardless of what
+    follows."""
+    action = PendingAction(
+        name="type_text",
+        params={"index": 1, "text": "card: 4111 1111 1111 1111x"},
+    )
+    assert is_sensitive(action) is True
+
+
+def test_typing_credit_card_at_min_length_sensitive():
+    """13 digits is the shortest standard card length (Visa/MC)."""
+    action = PendingAction(name="type_text", params={"index": 1, "text": "1234567890123"})
+    assert is_sensitive(action) is True
+
+
+def test_typing_credit_card_at_max_length_sensitive():
+    """19 digits is the longest standard card length (Maestro)."""
+    action = PendingAction(name="type_text", params={"index": 1, "text": "1234567890123456789"})
+    assert is_sensitive(action) is True
+
+
+def test_typing_phone_number_not_sensitive():
+    """10 digits with dashes is a phone number, not a card."""
+    action = PendingAction(name="type_text", params={"index": 1, "text": "555-123-4567"})
+    assert is_sensitive(action) is False
+
+
+def test_typing_short_id_not_sensitive():
+    """12 digits (below the 13-digit card minimum) is not a card."""
+    action = PendingAction(name="type_text", params={"index": 1, "text": "123456789012"})
+    assert is_sensitive(action) is False
+
+
+# --- PII-in-other-actions regression (exfiltration path) ---
+
+
+def test_done_with_credit_card_sensitive():
+    """An agent that extracts a card number and returns it via done()
+    must still be flagged — the canonical PII exfiltration path."""
+    action = PendingAction(
+        name="done",
+        params={"result": "the card is 4111 1111 1111 1111"},
+    )
+    assert is_sensitive(action) is True
+
+
+def test_done_with_ssn_sensitive():
+    action = PendingAction(
+        name="done",
+        params={"result": "SSN: 123-45-6789"},
+    )
+    assert is_sensitive(action) is True
+
+
+def test_done_with_email_sensitive():
+    action = PendingAction(
+        name="done",
+        params={"result": "contact: user@example.com"},
+    )
+    assert is_sensitive(action) is True
+
+
+def test_extract_with_email_sensitive():
+    """An extract action whose query contains an email is sensitive —
+    the agent is being asked to pull PII out of the page."""
+    action = PendingAction(
+        name="extract",
+        params={"query": "find user@example.com"},
+    )
+    assert is_sensitive(action) is True
+
+
+def test_done_with_benign_text_not_sensitive():
+    """done() with no PII and no sensitive keyword is not sensitive."""
+    action = PendingAction(
+        name="done",
+        params={"result": "the page title is Example Domain"},
+    )
+    assert is_sensitive(action) is False
+
+
 def test_typing_plain_text_not_sensitive():
     action = PendingAction(name="type_text", params={"index": 1, "text": "hello world"})
     assert is_sensitive(action) is False
@@ -104,6 +199,40 @@ def test_llm_errors_return_none():
         return await classify_sensitive_llm(action, BrokenModel())
 
     assert asyncio.run(run()) is None
+
+
+def test_llm_errors_log_warning(caplog):
+    """When the model call fails, classify_sensitive_llm must log a
+    warning — fail-open is the documented policy, but a quiet API outage
+    silently disabling the LLM safety control is worse than a noisy log."""
+    import asyncio
+    import logging
+
+    class BrokenModel:
+        async def ainvoke(self, messages, output_format=None, **kwargs):
+            raise RuntimeError("api down")
+
+    action = PendingAction(name="click", params={"element_text": "Read more"})
+
+    async def run():
+        with caplog.at_level(logging.WARNING, logger="browser_agent.safety.classifier"):
+            return await classify_sensitive_llm(action, BrokenModel())
+
+    asyncio.run(run())
+    assert any("classify_sensitive_llm" in r.message for r in caplog.records)
+
+
+def test_extract_text_unknown_shape_returns_none():
+    """An ainvoke result that has neither .content nor .completion must
+    not be passed through str() — that could yield a string that happens
+    to start with 'YES' and falsely flag the action."""
+    from browser_agent.safety.classifier import _extract_text
+
+    class Weird:
+        def __str__(self):
+            return "YES this is dangerous"  # would be a false positive
+
+    assert _extract_text(Weird()) is None
 
 
 # --- Word-boundary regression tests (false positives the old substring

@@ -65,17 +65,25 @@ class SafetyLayer:
                 _log.info("guard action=%s allow=%s reason=%r", action.name, verdict.allow, verdict.reason)
                 return verdict
 
-        if is_sensitive(action):
-            decision = await self._gate.confirm(action)
-            _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
-            return decision
-
-        if (
+        needs_gate = is_sensitive(action) or (
             self._cfg.sensitivity_llm
             and self._chat_model is not None
             and await classify_sensitive_llm(action, self._chat_model)
-        ):
+        )
+        if needs_gate:
             decision = await self._gate.confirm(action)
+            # Re-check the kill switch after the await: the operator may have
+            # engaged it during the (potentially long) confirmation wait, and
+            # the kill switch is the one control that must be unconditional.
+            # NOTE: this re-check reads self._cfg.kill_switch on the same
+            # Config instance — it works for in-memory toggles (e.g. a
+            # future UI button that sets cfg.kill_switch = True). It does NOT
+            # see .env rewrites; Config is loaded once at construction.
+            # Reactive .env reloading is addressed separately (Phase D.6, M9).
+            if self._cfg.kill_switch and decision.allow:
+                decision = SafetyDecision(
+                    allow=False, reason="kill switch engaged during confirmation"
+                )
             _log.info("guard action=%s allow=%s reason=%r", action.name, decision.allow, decision.reason)
             return decision
 

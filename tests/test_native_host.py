@@ -389,3 +389,52 @@ class TestBraveNativeMessagingPolicy:
             "'Access to the specified native messaging host is forbidden' and "
             "the keychain bridge will silently fall back to chrome.storage.local."
         )
+
+
+def test_rendered_manifest_is_gitignored():
+    """The rendered Chrome native messaging manifest contains
+    machine-specific absolute paths and the developer's extension ID.
+    It MUST be gitignored so a fresh checkout doesn't pick up a stale
+    path, and so a developer who runs install.sh doesn't accidentally
+    `git add` their personal config.
+
+    The .template file is the source of truth; install.sh renders
+    the final .json from it.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    rendered = (
+        repo_root
+        / "extension"
+        / "native_host"
+        / "com.browseragent.native_host.json"
+    )
+    # If the file doesn't exist in the working tree (clean checkout),
+    # git check-ignore will report "no path matched" and we still want
+    # the test to verify the .gitignore entry exists.
+    result = subprocess.run(
+        ["git", "check-ignore", "-v", str(rendered)],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+    # git check-ignore exits 0 when the path is ignored, 1 when not,
+    # 128 when the path doesn't exist (e.g. clean checkout). The -v
+    # output always shows the matching line on success.
+    if result.returncode == 0:
+        assert "extension/native_host/com.browseragent.native_host.json" in (
+            result.stdout
+        )
+        assert ".gitignore" in result.stdout
+    else:
+        # File doesn't exist in the working tree — verify the .gitignore
+        # entry by reading the file directly.
+        gitignore = (repo_root / ".gitignore").read_text()
+        assert (
+            "extension/native_host/com.browseragent.native_host.json"
+            in gitignore
+        ), (
+            "The rendered native messaging manifest must be in "
+            ".gitignore — its absolute path and extension ID are "
+            "machine-specific. Add it to .gitignore so a fresh "
+            "checkout doesn't pick up a stale path."
+        )

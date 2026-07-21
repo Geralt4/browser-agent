@@ -21,3 +21,10 @@ agent_history/
 # Benchmark run artifacts (logs and results regenerate on each run)
 benchmarks/*.log
 benchmarks/results/
+
+# Rendered Chrome native messaging manifest. The .template file is the
+# source of truth — install.sh renders the absolute path and (optional)
+# extension ID into the final .json. Committing the rendered output
+# leaks one developer's home directory and extension ID into the repo
+# history, and the absolute path is meaningless to anyone else.
+extension/native_host/com.browseragent.native_host.json

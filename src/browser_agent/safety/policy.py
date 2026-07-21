@@ -12,8 +12,12 @@ def host_of(url: str) -> str:
 def _matches(pattern: str, host: str) -> bool:
     """Match a host pattern against a hostname using suffix matching.
 
-    'example.com' matches 'example.com' and 'www.example.com'.
-    '.example.com' matches only subdomains of example.com.
+    'example.com' matches 'example.com' and any subdomain of 'example.com'
+    (e.g. 'www.example.com', 'mail.example.com'). The leading dot is
+    optional on the apex; ".example.com" also matches the bare apex
+    'example.com' (treated as an alias of the un-dotted form). A leading
+    dot does NOT narrow to "subdomains only" — the code consistently
+    matches the apex regardless.
     """
     if pattern.startswith("."):
         return host.endswith(pattern) or host == pattern[1:]

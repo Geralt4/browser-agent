@@ -84,14 +84,22 @@ def _check_expect(result: str, expect: str | None) -> bool:
     """Case-insensitive word-boundary match of `expect` against the agent result.
 
     Returns True iff `expect` is non-empty and appears as a whole word/phrase
-    (case-insensitively) in `result`. Uses word-boundary regex to avoid
-    substring false-positives like "Success" matching "unsuccessful".
-    A None/empty `expect` is treated as "no ground truth provided" and
-    returns False.
+    (case-insensitively) in `result`. Uses lookbehind/lookahead word-boundary
+    pairs to avoid substring false-positives like "Success" matching
+    "unsuccessful". A None/empty `expect` is treated as "no ground truth
+    provided" and returns False.
+
+    Uses `(?<![A-Za-z0-9_])...(?![A-Za-z0-9_])` rather than `\b...\b` so
+    non-word-char-bounded expect values like "(Domain)", "$10.00", "C++"
+    still match. Previously `\b` silently failed because there was no word
+    char on the `expect` side of the boundary for `\b` to anchor to.
     """
     if not expect:
         return False
-    return bool(re.search(r"\b" + re.escape(expect) + r"\b", result or "", re.IGNORECASE))
+    pattern = (
+        r"(?<![A-Za-z0-9_])" + re.escape(expect) + r"(?![A-Za-z0-9_])"
+    )
+    return bool(re.search(pattern, result or "", re.IGNORECASE))
 
 
 # CSV columns used when --repeats > 1. Mirrors CSV_FIELDS but with repeat-aware

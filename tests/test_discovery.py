@@ -37,6 +37,29 @@ class TestNormalizeUrl:
     def test_strips_whitespace(self):
         assert _normalize_url("  https://api.openai.com  ") == "https://api.openai.com/v1"
 
+    def test_dedupes_doubled_v1(self):
+        """`/v1/v1` collapses to a single `/v1`. Without dedup, the
+        normalized URL would be wrong (and the SSRF guard would
+        reject a legitimate URL with an accidentally-doubled suffix)."""
+        assert _normalize_url("https://api.openai.com/v1/v1") == "https://api.openai.com/v1"
+
+    def test_dedupes_tripled_v1(self):
+        assert _normalize_url("https://api.openai.com/v1/v1/v1") == "https://api.openai.com/v1"
+
+    def test_preserves_path_then_appends_v1(self):
+        """A URL with a non-/v1 path gets /v1 appended at the end."""
+        assert _normalize_url("https://api.example.com/foo") == "https://api.example.com/foo/v1"
+
+    def test_preserves_v1_path_then_appends_v1(self):
+        """A URL whose path already includes /v1 as a non-trailing
+        segment gets another /v1 appended."""
+        assert _normalize_url("https://api.example.com/v1/bar") == "https://api.example.com/v1/bar/v1"
+
+    def test_appends_v1_to_v1_path_with_extra_v1(self):
+        """`/v1/bar/v1` normalizes to itself — trailing /v1 is stripped
+        then re-appended, leaving the path with its terminal /v1."""
+        assert _normalize_url("https://api.example.com/v1/bar/v1") == "https://api.example.com/v1/bar/v1"
+
 
 class TestIsAllowedBaseUrl:
     def test_exact_match(self):
@@ -195,7 +218,22 @@ class TestFetchModels:
 
     @patch("browser_agent.models.discovery.urllib.request.urlopen")
     def test_timeout_raises(self, mock_urlopen):
+        """Bare `TimeoutError` (the rare path) reports "Timeout"."""
         mock_urlopen.side_effect = TimeoutError()
+        with pytest.raises(ModelDiscoveryError) as exc:
+            fetch_models("https://api.example.com", "key")
+        assert "Timeout" in str(exc.value)
+
+    @patch("browser_agent.models.discovery.urllib.request.urlopen")
+    def test_wrapped_timeout_via_urlerror_raises(self, mock_urlopen):
+        """The common path: `urlopen` wraps socket timeouts as
+        `URLError(reason=socket.timeout())`. Without the type-check
+        inside the `URLError` branch, this would surface as the
+        generic "Could not reach ...: timed out" — confusing for an
+        operator trying to distinguish a timeout from a DNS failure."""
+        mock_urlopen.side_effect = urllib.error.URLError(
+            reason=TimeoutError("timed out")
+        )
         with pytest.raises(ModelDiscoveryError) as exc:
             fetch_models("https://api.example.com", "key")
         assert "Timeout" in str(exc.value)

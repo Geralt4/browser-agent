@@ -13,12 +13,23 @@ from browser_agent.safety import PendingAction, SafetyLayer
 # action registry compares the *runtime class* of `browser_session`, and PEP 563
 # string annotations would break that check.
 
-# Built-ins with no gated replacement that we drop outright. `input` is replaced
-# by the gated `type_text`; `evaluate` (arbitrary JS) is an easy attack-surface
-# win to remove. navigate/click/scroll are overridden in place by re-registering
-# the same name below. Tightening the full toolset to exactly the Phase 3 six is
-# a Phase 4 hardening step.
-EXCLUDED_BUILTINS = ["input", "evaluate"]
+# Allowlist: only the six gated actions below are exposed to the agent. Every
+# other browser-use built-in is dropped — see CLAUDE.md Phase 3 ("Tools: click,
+# type, navigate, scroll, extract, done"). The allowlist is the safety boundary:
+# `search` would bypass the navigation blocklist, `send_keys` would bypass the
+# password-field check, `write_file` would mutate the filesystem un-gated, etc.
+# To add a new gated action, add the name to _GATED below and re-register the
+# gated implementation in build_tools().
+_GATED = frozenset({"click", "done", "extract", "navigate", "scroll", "type_text"})
+
+_BUILTIN_ACTION_NAMES = frozenset({
+    "click", "close", "done", "dropdown_options", "evaluate", "extract",
+    "find_elements", "find_text", "go_back", "input", "navigate", "read_file",
+    "replace_file", "save_as_pdf", "screenshot", "scroll", "search",
+    "search_page", "select_dropdown", "send_keys", "switch", "upload_file",
+    "wait", "write_file",
+})
+EXCLUDED_BUILTINS = sorted(_BUILTIN_ACTION_NAMES - _GATED)
 
 
 class DoneParams(BaseModel):

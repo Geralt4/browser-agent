@@ -1,5 +1,5 @@
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -18,8 +18,15 @@ def fixture_url():
 
     Hermetic (loopback only) so the interaction smoke never depends on a live
     external site or hits anti-bot friction.
+
+    ThreadingHTTPServer handles concurrent connections (a real headless
+    browser opens multiple sockets to the same origin), avoiding stalls
+    that a plain HTTPServer would cause. Each server is fully torn down —
+    `server_close()` releases the listening socket so the port can be
+    reused — and teardown is wrapped in try/finally so a failure in one
+    server doesn't skip cleanup of the rest.
     """
-    servers: list[tuple[HTTPServer, threading.Thread]] = []
+    servers: list[tuple[ThreadingHTTPServer, threading.Thread]] = []
 
     def _serve(filename: str) -> str:
         body = (FIXTURES / filename).read_bytes()
@@ -35,7 +42,7 @@ def fixture_url():
             def log_message(self, *args):
                 pass
 
-        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         servers.append((server, thread))
@@ -44,5 +51,8 @@ def fixture_url():
     yield _serve
 
     for server, thread in servers:
-        server.shutdown()
-        thread.join(timeout=2)
+        try:
+            server.shutdown()
+            server.server_close()
+        finally:
+            thread.join(timeout=2)

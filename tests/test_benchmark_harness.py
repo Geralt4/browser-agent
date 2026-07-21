@@ -502,9 +502,8 @@ def test_summarize_aggregated_uses_weighted_pass_rate():
     # Weighted: 4/8 = 50%. Per-row mean would also be 50% here so we
     # also assert the totals are right.
     assert s["pass_rate"] == 50.0
-    assert s["total"] == 2
-    assert s["passed"] == 4
-    assert s["total_runs" if False else "passed"] == 4  # total_pass
+    assert s["total"] == 2  # 2 distinct tasks
+    assert s["passed"] == 4  # cumulative pass count across all runs
     assert s["repeats"] == 4
     assert s["timeouts"] == 0
     assert s["errors"] == 0

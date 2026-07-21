@@ -29,6 +29,44 @@ _TASKS: dict[str, dict[str, Any]] = {}
 _TASK_TTL = 600  # seconds before an orphaned task entry is cleaned up
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _task_semaphore: asyncio.Semaphore | None = None
+_config_lock: asyncio.Lock | None = None
+# Per-task SSE subscriber reference count. A task entry's `_subscribers` is
+# incremented when a stream client connects and decremented on disconnect.
+# Only the last subscriber to leave (or the agent itself finishing) cancels
+# the agent task — otherwise a single client disconnect would kill the agent
+# for any other concurrent subscribers.
+_SUBSCRIBER_KEY = "_subscribers"
+# Cached config-token read with a short TTL. Avoids re-parsing .env on
+# every auth'd request (and a token-rotation TOCTOU between the read and
+# the compare).
+_TOKEN_TTL_S = 1.0
+_token_cache: tuple[float, str | None] | None = None
+
+
+async def _read_json_body(request: Request) -> dict[str, Any]:
+    """FastAPI dependency: parse JSON body or return 400 on decode error.
+
+    Wraps `request.json()` so endpoints consistently turn a malformed
+    body into a 400 with a useful error message instead of a 500 from
+    an unhandled `json.JSONDecodeError`. Returns an empty dict when the
+    body is empty (FastAPI's `json()` raises on empty input).
+    """
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid JSON body: {exc.msg} (line {exc.lineno}, col {exc.colno})",
+        ) from exc
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="JSON body must be an object",
+        )
+    return result
 
 
 def _track(task: asyncio.Task) -> asyncio.Task:
@@ -40,9 +78,10 @@ def _track(task: asyncio.Task) -> asyncio.Task:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _task_semaphore
+    global _task_semaphore, _config_lock
     cfg = load_config()
     _task_semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
+    _config_lock = asyncio.Lock()
     _track(asyncio.create_task(_cleanup_orphans()))
     yield
 
@@ -53,10 +92,21 @@ app = FastAPI(title="Browser Agent", lifespan=lifespan)
 def _configured_token() -> str | None:
     """Return the API token from the current .env, or None if unset.
 
-    Read per-request (not cached at startup) so token rotation via .env edit
-    takes effect without a restart, and so tests can monkeypatch the env.
+    Cached for a short TTL (1s) to avoid re-parsing .env on every
+    auth'd request, and to give a tight, predictable window for token
+    rotation. Outside the window a fresh read picks up the rotation.
     """
-    return load_config().browser_agent_api_token
+    import time
+
+    global _token_cache
+    now = time.monotonic()
+    if _token_cache is not None:
+        cached_at, cached_value = _token_cache
+        if now - cached_at < _TOKEN_TTL_S:
+            return cached_value
+    value = load_config().browser_agent_api_token
+    _token_cache = (now, value)
+    return value
 
 
 def _require_auth(request: Request) -> None:
@@ -84,8 +134,21 @@ def _require_auth(request: Request) -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html = (pathlib.Path(__file__).parent / "static" / "index.html").read_text()
-    return html
+    """Serve the SPA shell.
+
+    Returns a minimal fallback page if the static asset is missing
+    (e.g. partial install). Path is constructed from __file__ — not
+    user input — so no path-traversal risk.
+    """
+    html_path = pathlib.Path(__file__).parent / "static" / "index.html"
+    try:
+        return html_path.read_text()
+    except FileNotFoundError:
+        return HTMLResponse(
+            "<h1>UI not installed</h1>"
+            "<p>static/index.html is missing. Reinstall the package.</p>",
+            status_code=404,
+        )
 
 
 @app.get("/api/config")
@@ -123,7 +186,10 @@ _CONFIG_KEYS: dict[str, str] = {
 
 
 @app.post("/api/config", dependencies=[Depends(_require_auth)])
-async def update_config(request: Request):
+async def update_config(
+    request: Request,
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
     """Persist safe config fields to .env (process-wide, survives restart).
 
     Accepts the same lowercase keys GET /api/config returns. Empty strings are
@@ -135,19 +201,32 @@ async def update_config(request: Request):
     each /api/task builds an isolated Config via `with_overrides()` at submit
     time, so in-flight tasks are unaffected by a config write mid-run. Per-task
     overrides belong in the POST /api/task body, not here.
+
+    The read-modify-write of .env is serialized with an asyncio lock so two
+    concurrent POSTs don't clobber each other's writes. The lock is lazily
+    initialized to match the semaphore pattern in `create_task` — both
+    handle the lifespan-less deployment identically.
     """
-    body = await request.json()
-    env_path = _env_path()
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_env(env_path)
-    for lower, env_key in _CONFIG_KEYS.items():
-        if lower in body:
-            value = body[lower]
-            existing[env_key] = "" if value is None else str(value)
-        elif env_key in body:
-            value = body[env_key]
-            existing[env_key] = "" if value is None else str(value)
-    _write_env(env_path, existing)
+    global _config_lock
+    if _config_lock is None:
+        _config_lock = asyncio.Lock()
+        log.warning(
+            "_config_lock was None at request time — lifespan did not run. "
+            "Initialized lazily; check that the app is served via an ASGI "
+            "lifespan-aware runner (e.g. uvicorn)."
+        )
+    async with _config_lock:
+        env_path = _env_path()
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = _read_env(env_path)
+        for lower, env_key in _CONFIG_KEYS.items():
+            if lower in body:
+                value = body[lower]
+                existing[env_key] = "" if value is None else str(value)
+            elif env_key in body:
+                value = body[env_key]
+                existing[env_key] = "" if value is None else str(value)
+        _write_env(env_path, existing)
     return {"status": "ok"}
 
 
@@ -218,9 +297,26 @@ def _require_auth_optional(request: Request) -> None:
 
 
 @app.post("/api/task", dependencies=[Depends(_require_auth_optional)])
-async def create_task(request: Request):
-    body = await request.json()
-    task_text = body.get("task", "").strip()
+async def create_task(
+    request: Request,
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    # Lazy-init the semaphore if the lifespan didn't run (e.g. a non-ASGI
+    # server that doesn't fire lifespan, or a one-off script importing the
+    # app). Without this, a missing-lifespan deployment would silently
+    # disable rate limiting and orphan cleanup.
+    global _task_semaphore
+    if _task_semaphore is None:
+        cfg = load_config()
+        _task_semaphore = asyncio.Semaphore(cfg.max_concurrent_tasks)
+        _track(asyncio.create_task(_cleanup_orphans()))
+        log.warning(
+            "_task_semaphore was None at request time — lifespan did not run. "
+            "Initialized lazily; check that the app is served via an ASGI "
+            "lifespan-aware runner (e.g. uvicorn)."
+        )
+
+    task_text = str(body.get("task", "")).strip()
     if not task_text:
         return JSONResponse(content={"error": "task is required"}, status_code=400)
 
@@ -314,8 +410,18 @@ async def stream_task(task_id: str):
 
     queue = entry["queue"]
     agent_task: asyncio.Task | None = entry.get("task")
+    # Reference-count concurrent subscribers. The task entry stays in
+    # _TASKS until every subscriber has disconnected (or the agent
+    # itself has finished), so a second client connecting to the same
+    # task_id still gets the events. Only the LAST subscriber to leave
+    # cancels the agent task — and only if the agent hasn't already
+    # produced a terminal event (done/error) for them.
+    entry[_SUBSCRIBER_KEY] = entry.get(_SUBSCRIBER_KEY, 0) + 1
 
     async def generator():
+        # The original `_TASKS.pop(task_id, None)` here would delete
+        # the entry for any other concurrent subscriber. Track locally
+        # and only pop when the last subscriber leaves.
         try:
             while True:
                 item = await queue.get()
@@ -323,18 +429,26 @@ async def stream_task(task_id: str):
                 if item["type"] in ("done", "error"):
                     break
         except asyncio.CancelledError:
-            if agent_task is not None and not agent_task.done():
+            # A client disconnect mid-stream: cancel the agent task
+            # only if no other subscriber is still listening and the
+            # agent has not already terminated.
+            if entry.get(_SUBSCRIBER_KEY, 0) <= 1 and \
+                    agent_task is not None and not agent_task.done():
                 agent_task.cancel()
+            raise
         finally:
-            _TASKS.pop(task_id, None)
+            entry[_SUBSCRIBER_KEY] = max(0, entry.get(_SUBSCRIBER_KEY, 0) - 1)
+            if entry.get(_SUBSCRIBER_KEY, 0) == 0:
+                _TASKS.pop(task_id, None)
 
     return EventSourceResponse(generator())
 
 
 @app.post("/api/gate/approve")
-async def gate_approve(request: Request):
-    body = await request.json()
-    gate_id = body.get("gate_id", "")
+async def gate_approve(
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    gate_id = str(body.get("gate_id", ""))
 
     for entry in _TASKS.values():
         gate = entry["gate"]
@@ -344,9 +458,10 @@ async def gate_approve(request: Request):
 
 
 @app.post("/api/gate/deny")
-async def gate_deny(request: Request):
-    body = await request.json()
-    gate_id = body.get("gate_id", "")
+async def gate_deny(
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    gate_id = str(body.get("gate_id", ""))
 
     for entry in _TASKS.values():
         gate = entry["gate"]
@@ -412,11 +527,12 @@ async def keychain_ping():
 
 
 @app.post("/api/keychain/set")
-async def keychain_set(request: Request):
-    body = await request.json()
-    service = body.get("service", "")
-    key = body.get("key", "")
-    value = body.get("value", "")
+async def keychain_set(
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    service = str(body.get("service", ""))
+    key = str(body.get("key", ""))
+    value = str(body.get("value", ""))
     _validate_keychain_params(service, key)
     try:
         import keyring
@@ -427,10 +543,11 @@ async def keychain_set(request: Request):
 
 
 @app.post("/api/keychain/get")
-async def keychain_get(request: Request):
-    body = await request.json()
-    service = body.get("service", "")
-    key = body.get("key", "")
+async def keychain_get(
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    service = str(body.get("service", ""))
+    key = str(body.get("key", ""))
     _validate_keychain_params(service, key)
     try:
         import keyring
@@ -441,24 +558,28 @@ async def keychain_get(request: Request):
 
 
 @app.post("/api/keychain/delete")
-async def keychain_delete(request: Request):
-    body = await request.json()
-    service = body.get("service", "")
-    key = body.get("key", "")
+async def keychain_delete(
+    body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
+):
+    service = str(body.get("service", ""))
+    key = str(body.get("key", ""))
     _validate_keychain_params(service, key)
     try:
         import keyring
-        # PasswordDeleteError means "not present" — treat as success so
+        from keyring.errors import PasswordDeleteError
+        # `PasswordDeleteError` means "not present" — treat as success so
         # the client can call delete idempotently, matching the native
-        # host's behavior in native_host.py. The `keyring` package
-        # doesn't ship type stubs, so we catch the base Exception below
-        # and re-raise non-delete errors — the native host does the same
-        # via a try/except in its dispatch loop.
+        # host's behavior. We import the exception by type with a
+        # KeyError/FileNotFoundError fallback for keyring backends that
+        # raise something different on missing entries.
+
         try:
             keyring.delete_password(service, key)
-        except Exception as exc:  # noqa: BLE001
-            if type(exc).__name__ != "PasswordDeleteError":
-                raise
+        except PasswordDeleteError:
+            pass
+        except (KeyError, FileNotFoundError):
+            # Some backends raise these on a missing entry.
+            pass
     except Exception as exc:
         return _keychain_error_response(exc)
     return {"ok": True}

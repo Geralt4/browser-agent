@@ -19,6 +19,13 @@ jobs:
       - name: Install project
         run: uv sync
 
+      - name: Install Playwright browsers
+        # test_interaction_tools.py launches a real Chromium via Playwright.
+        # `uv sync` installs the `playwright` Python package but does NOT
+        # download the browser binary; without this step the test fails
+        # with "Executable doesn't exist at ...".
+        run: uv run playwright install --with-deps chromium
+
       - name: Lint
         run: uv run ruff check .
 

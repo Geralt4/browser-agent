@@ -1,6 +1,6 @@
 [project]
 name = "browser-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted browser automation agent powered by open-weight LLMs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,11 @@ dev = [
     "pytest>=9.0.3",
     "ruff>=0.4.0",
 ]
+
+[tool.pytest.ini_options]
+# benchmarks/ lives at the repo root and isn't a package; without this, the
+# benchmark tests fail at collection with `No module named 'benchmarks'`.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

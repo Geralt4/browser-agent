@@ -88,3 +88,62 @@ def test_streaming_gate_cleans_up_on_cancel():
         assert len(gate._events) == 0  # cleaned up, no leak
 
     asyncio.run(run())
+
+
+def test_kill_switch_during_confirm_denies_approved_action():
+    """TOCTOU regression: the kill switch is checked once at the top of
+    guard(), but gate.confirm() can block for up to _timeout seconds. If
+    the operator engages the kill switch while the user is approving the
+    action, the approved action must still be denied. Without the post-
+    await re-check, the action would proceed despite the kill switch."""
+    cfg = Config()  # kill_switch=False initially
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def slow_confirm(action: PendingAction) -> SafetyDecision:
+        started.set()
+        await proceed.wait()  # simulate a long user prompt
+        return SafetyDecision(allow=True, reason="approved by human (test)")
+
+    layer = SafetyLayer(cfg, gate=ConfirmationGate(confirm=slow_confirm))
+
+    async def run():
+        task = asyncio.create_task(layer.guard(DELETE))
+        await started.wait()  # confirm() is now awaiting proceed
+        # Operator flips the kill switch while the user is approving.
+        cfg.kill_switch = True
+        proceed.set()  # let the simulated user approve
+        return await task
+
+    decision = asyncio.run(run())
+    assert decision.allow is False
+    assert "kill switch" in decision.reason.lower()
+
+
+def test_kill_switch_during_confirm_does_not_override_denial():
+    """If the gate already denied, a kill-switch re-check is a no-op (the
+    action is denied either way; we should not overwrite the original
+    reason)."""
+    cfg = Config()
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def deny_confirm(action: PendingAction) -> SafetyDecision:
+        started.set()
+        await proceed.wait()
+        return SafetyDecision(allow=False, reason="denied by human (test)")
+
+    layer = SafetyLayer(cfg, gate=ConfirmationGate(confirm=deny_confirm))
+
+    async def run():
+        task = asyncio.create_task(layer.guard(DELETE))
+        await started.wait()
+        cfg.kill_switch = True
+        proceed.set()
+        return await task
+
+    decision = asyncio.run(run())
+    assert decision.allow is False
+    # The original "denied by human" reason is preserved (kill-switch
+    # re-check only overrides an allow=True decision).
+    assert "denied by human" in decision.reason

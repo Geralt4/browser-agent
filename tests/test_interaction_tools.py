@@ -139,3 +139,56 @@ def test_done_action_registry_accepts_deepseek_payload():
     done_variant = next(a for a in args if "Done" in a.__name__)
     out = done_variant.model_validate({"done": {"result": "ok", "success": True}})
     assert out.done.result == "ok"
+
+
+def test_build_tools_exposes_only_gated_actions():
+    """Only the six gated actions (click, done, extract, navigate, scroll,
+    type_text) are exposed. Every other browser-use built-in is excluded —
+    otherwise un-gated actions like `search`, `send_keys`, `write_file` would
+    bypass SafetyLayer.guard() entirely (e.g. `search` would skip the
+    navigation blocklist, `send_keys` would skip the password-field check)."""
+    from browser_agent.config import Config
+    from browser_agent.safety import SafetyLayer
+    from browser_agent.tools.actions import _GATED, build_tools
+
+    tools = build_tools(SafetyLayer(Config()))
+    registered = set(tools.registry.registry.actions.keys())
+    assert registered == _GATED, (
+        f"Registered actions mismatch: extra={registered - _GATED} "
+        f"missing={_GATED - registered}"
+    )
+
+
+def test_search_action_is_excluded():
+    """`search` would dispatch NavigateToUrlEvent un-gated and skip the
+    navigation blocklist. It must not be in the registered set."""
+    from browser_agent.config import Config
+    from browser_agent.safety import SafetyLayer
+    from browser_agent.tools.actions import build_tools
+
+    tools = build_tools(SafetyLayer(Config()))
+    assert "search" not in tools.registry.registry.actions
+
+
+def test_write_file_action_is_excluded():
+    """`write_file` would mutate the filesystem with no sensitivity gate. It
+    must not be in the registered set."""
+    from browser_agent.config import Config
+    from browser_agent.safety import SafetyLayer
+    from browser_agent.tools.actions import build_tools
+
+    tools = build_tools(SafetyLayer(Config()))
+    assert "write_file" not in tools.registry.registry.actions
+    assert "replace_file" not in tools.registry.registry.actions
+    assert "read_file" not in tools.registry.registry.actions
+
+
+def test_send_keys_action_is_excluded():
+    """`send_keys` would dispatch keyboard input un-gated and skip the
+    password-field check. It must not be in the registered set."""
+    from browser_agent.config import Config
+    from browser_agent.safety import SafetyLayer
+    from browser_agent.tools.actions import build_tools
+
+    tools = build_tools(SafetyLayer(Config()))
+    assert "send_keys" not in tools.registry.registry.actions

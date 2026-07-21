@@ -1,4 +1,4 @@
-#!/Users/giannismanologlou/Documents/Browser-agent/.venv/bin/python3
+#!/usr/bin/env python3
 """Chrome native messaging host for browser-agent.
 
 This is a tiny stdio proxy between the Chrome extension and the OS keychain.

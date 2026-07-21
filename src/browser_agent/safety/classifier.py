@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -7,6 +8,8 @@ from browser_agent.safety.types import PendingAction
 
 if TYPE_CHECKING:
     from browser_use.llm.base import BaseChatModel
+
+_log = logging.getLogger(__name__)
 
 # Irreversible / sensitive intents the brief calls out: send, publish, purchase,
 # delete, submit. Matched against an action's textual params (element label,
@@ -55,11 +58,28 @@ _PASSWORD_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Action params whose values carry user-visible / agent-visible text content.
+# PII regexes are only run against these keys, never against the full param
+# blob — including a numeric element index in the PII check would let
+# `type_text(index=1, text="123456789012")` produce the blob "1 123456789012"
+# and be falsely flagged as a credit card.
+_PII_TEXT_KEYS = frozenset({"text", "result", "query"})
+
 # Personal / payment data typed into a field -> always confirm.
-# Matches 13-19 digit sequences with optional separators (spaces/dashes).
-# Requires a digit on both sides of any separator to reduce false positives
-# on numeric IDs that happen to be 13-16 chars.
-_CARD_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+# Matches a 13-19 digit run with optional separators (spaces/dashes).
+# The previous `(?:\d[ -]?){13,19}` pattern with a trailing `\b` had two
+# failure modes:
+#   1. The trailing optional separator could be matched without a following
+#      digit, defeating the "digit on both sides" rule.
+#   2. A trailing `\b` rejects a card number followed by any word char
+#      (e.g. "4111 1111 1111 1111x") because there is no word boundary
+#      between two adjacent word characters.
+# The new pattern starts on a digit, requires 12-18 more (sep+digit) groups
+# so the match always ends on a digit, and omits the trailing \b so a
+# card number embedded in surrounding text (or followed by a letter) still
+# matches. The leading \b is kept to prevent the regex from greedily
+# matching a 19-digit substring of a longer digit run.
+_CARD_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}")
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
@@ -94,6 +114,16 @@ def is_sensitive(action: PendingAction) -> bool:
     checks, so short keywords like "post"/"pay"/"buy" don't fire on
     "poster"/"payment"/"buyer". Multi-word keywords ("place order",
     "close account") tolerate arbitrary whitespace between words.
+
+    PII detection (card / SSN / email) runs against the text-bearing
+    params for every non-navigate action — not just `type_text` — so that
+    an agent that extracts PII and returns it via `done()` (the canonical
+    exfiltration path) is still flagged. The text-bearing keys are
+    `text` (type_text), `result` (done), and `query` (extract); the index
+    / element_text / new_tab fields are excluded so a numeric element
+    index doesn't get concatenated into a "card number". The password-
+    label check stays `type_text`-specific because it keys on the field's
+    `element_text` (the other actions don't carry a field label).
     """
     if action.name == "navigate":
         return False
@@ -102,10 +132,13 @@ def is_sensitive(action: PendingAction) -> bool:
     if _SENSITIVE_KW_RE.search(blob):
         return True
 
+    text_blob = " ".join(
+        str(v) for k, v in action.params.items() if k in _PII_TEXT_KEYS
+    )
+    if _CARD_RE.search(text_blob) or _SSN_RE.search(text_blob) or _EMAIL_RE.search(text_blob):
+        return True
+
     if action.name in {"type_text"}:
-        text = str(action.params.get("text", ""))
-        if _CARD_RE.search(text) or _SSN_RE.search(text) or _EMAIL_RE.search(text):
-            return True
         # Typing into a field whose label marks it as a password / secret
         # input is always sensitive, regardless of what's being typed.
         label = str(action.params.get("element_text", ""))
@@ -132,11 +165,22 @@ async def classify_sensitive_llm(
 
     try:
         result = await chat_model.ainvoke(messages)
-    except Exception:
+    except Exception as exc:
+        # Default-allow is the documented fail-open policy. Log a warning
+        # so a quiet API outage / malformed response doesn't silently
+        # disable the LLM safety control.
+        _log.warning(
+            "classify_sensitive_llm: model call failed (action=%s): %s",
+            action.name, exc,
+        )
         return None
 
     content = _extract_text(result)
     if content is None:
+        _log.warning(
+            "classify_sensitive_llm: could not extract text from result (action=%s)",
+            action.name,
+        )
         return None
     return content.strip().upper().startswith("YES")
 
@@ -151,4 +195,7 @@ def _extract_text(result: object) -> str | None:
     completion = getattr(result, "completion", None)
     if completion is not None:
         return str(completion)
-    return str(result)
+    # Unknown result shape: return None rather than `str(result)`. Falling
+    # through to `str()` on an arbitrary object could produce text that
+    # *starts* with "YES" by coincidence and falsely flag the action.
+    return None

@@ -26,6 +26,12 @@ if [[ ! -f "${HOST_PY}" ]]; then
   exit 1
 fi
 
+# Ensure the host is executable. A fresh checkout won't have the +x bit
+# set, and Chrome launches the host by exec'ing the `path` from the
+# manifest — without +x, the launch fails silently and the keychain
+# bridge falls back to chrome.storage.local.
+chmod +x "${HOST_PY}"
+
 if [[ ! -f "${TEMPLATE}" ]]; then
   echo "ERROR: template not found at ${TEMPLATE}" >&2
   exit 1
