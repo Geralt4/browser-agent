@@ -33,4 +33,9 @@ jobs:
         run: npx --yes pyright@1.1.410
 
       - name: Test
+        # BROWSER_AGENT_TEST_TIMEOUT caps the real-browser interaction
+        # tests (test_interaction_tools.py) so a stuck Chromium launch
+        # fails fast instead of blocking the suite for 15+ minutes.
+        env:
+          BROWSER_AGENT_TEST_TIMEOUT: "120"
         run: uv run pytest
