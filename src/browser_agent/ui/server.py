@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -50,7 +51,19 @@ async def _read_json_body(request: Request) -> dict[str, Any]:
     body into a 400 with a useful error message instead of a 500 from
     an unhandled `json.JSONDecodeError`. Returns an empty dict when the
     body is empty (FastAPI's `json()` raises on empty input).
+
+    S1 (CSRF hardening): require `Content-Type: application/json`. This
+    forces browsers to send a CORS preflight for any cross-origin
+    request, and the CORSMiddleware will reject the preflight. Simple
+    cross-origin POSTs with `text/plain` (the historical CSRF vector)
+    are now blocked at the server.
     """
+    content_type = request.headers.get("content-type", "")
+    if not content_type.split(";")[0].strip().lower() == "application/json":
+        raise HTTPException(
+            status_code=415,
+            detail="Content-Type must be application/json",
+        )
     raw = await request.body()
     if not raw:
         return {}
@@ -87,6 +100,33 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Browser Agent", lifespan=lifespan)
+
+# S5: CORS middleware — only allow requests from the browser extension
+# (any chrome-extension:// origin) and from the local web UI at
+# http://127.0.0.1:8000. Any other origin cannot call the API, which
+# blocks CSRF attacks where a malicious website tries to create tasks
+# or poison the keychain by submitting simple cross-origin POSTs.
+# Combined with the Content-Type check in _read_json_body (which
+# forces a CORS preflight), this fully blocks browser-initiated
+# cross-origin abuse.
+#
+# `allow_origin_regex` is required because the chrome-extension scheme
+# uses a per-instance UUID, not a fixed origin. `allow_origins`
+# does not support wildcards in Starlette's CORSMiddleware.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:8000",  # the local web UI
+    ],
+    allow_origin_regex=r"^chrome-extension://[a-z]{32}$",
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=[
+        "Content-Type",
+        "X-Auth-Token",
+        "X-API-Key",
+    ],
+)
 
 
 def _configured_token() -> str | None:
@@ -296,7 +336,41 @@ def _require_auth_optional(request: Request) -> None:
         raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
 
 
-@app.post("/api/task", dependencies=[Depends(_require_auth_optional)])
+def _require_auth_strict(request: Request) -> None:
+    """FastAPI dependency: ALWAYS require a valid X-Auth-Token (S7).
+
+    S7 fix: the previous `/api/task` endpoint used _require_auth_optional,
+    which silently allowed every request when BROWSER_AGENT_API_TOKEN was
+    unset. That made an unconfigured server trivially exploitable by any
+    browser visiting a malicious site (the malicious site would simply
+    POST to the local API — same as the CSRF chain described in S1/S5).
+
+    Strict semantics:
+    - No token configured  -> 403 (endpoint disabled, fail-closed)
+    - Header missing       -> 401
+    - Token mismatch       -> 401
+    - Match                -> None (request proceeds)
+
+    The extension stores the token and adds `X-Auth-Token` to every
+    request. The web UI (index.html) will be updated in a follow-up to
+    read the token from localStorage and include it in fetch() calls.
+    CLI usage is unaffected — `browser-agent` calls run_task_streaming
+    in-process, never via HTTP.
+    """
+    expected = _configured_token()
+    if not expected:
+        raise HTTPException(
+            status_code=403,
+            detail="endpoint disabled: set BROWSER_AGENT_API_TOKEN in .env",
+        )
+    provided = request.headers.get("X-Auth-Token", "")
+    if not provided:
+        raise HTTPException(status_code=401, detail="X-Auth-Token header required")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
+
+
+@app.post("/api/task", dependencies=[Depends(_require_auth_strict)])
 async def create_task(
     request: Request,
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
@@ -335,6 +409,21 @@ async def create_task(
             )
 
     cfg = load_config()
+    # S2 (SSRF guard): if the body supplies a base_url, it must normalize-match
+    # the configured LLM_BASE_URL. Without this, any caller could redirect
+    # outbound model traffic to an internal/external URL they control, which
+    # turns the model list discovery endpoint into an SSRF oracle. The check
+    # is intentionally strict: a missing/unset configured URL rejects every
+    # requested URL, so an unconfigured server cannot be coerced into
+    # fetching arbitrary targets.
+    requested_base_url = body.get("base_url")
+    if requested_base_url is not None and requested_base_url != "":
+        if not is_allowed_base_url(str(requested_base_url), cfg.llm_base_url):
+            return JSONResponse(
+                content={"error": "base_url not allowed by server policy"},
+                status_code=400,
+            )
+
     # API key is passed via the X-API-Key header (not the request body)
     # to avoid logging it in body-level middleware/crash dumps.
     api_key = request.headers.get("X-API-Key")

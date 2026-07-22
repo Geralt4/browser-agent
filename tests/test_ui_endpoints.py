@@ -371,25 +371,34 @@ class TestListModels:
 
 
 class TestTaskWithOverrides:
-    def test_missing_task(self, client, env_backup):
-        r = client.post("/api/task", json={})
+    def test_missing_task(self, client, authed_env):
+        """S7: with auth configured, send the token so the body
+        validator runs."""
+        r = client.post(
+            "/api/task",
+            json={},
+            headers={"X-Auth-Token": "secret-token"},
+        )
         assert r.status_code == 400
         assert "required" in r.json()["error"]
 
-    def test_unknown_provider(self, client, env_backup):
+    def test_unknown_provider(self, client, authed_env):
         r = client.post(
             "/api/task",
             json={"task": "do something", "provider": "nope"},
+            headers={"X-Auth-Token": "secret-token"},
         )
         assert r.status_code == 400
         assert "Unknown provider" in r.json()["error"]
 
-    def test_task_without_token_when_unset_succeeds(self, client, env_backup):
-        """When BROWSER_AGENT_API_TOKEN is not configured, /api/task is
-        open (fail-open) so the extension works out of the box."""
+    def test_task_without_token_when_unset_returns_403(self, client, env_backup):
+        """S7: /api/task is now strict — when BROWSER_AGENT_API_TOKEN is
+        not configured, the endpoint refuses every request with 403. The
+        previous fail-open behavior let any browser on localhost POST
+        tasks to the API, which is the CSRF primitive used by S1/S5."""
         r = client.post("/api/task", json={"task": "test"})
-        # Will get 400 (unknown provider) or 200 — the point is NOT 401.
-        assert r.status_code != 401
+        assert r.status_code == 403
+        assert "disabled" in r.json()["detail"]
 
     def test_task_with_token_when_set_requires_auth(self, client, authed_env):
         """When BROWSER_AGENT_API_TOKEN is configured, /api/task requires
@@ -417,6 +426,131 @@ class TestTaskWithOverrides:
         )
         assert r.status_code == 401
         assert "invalid" in r.json()["detail"]
+
+
+# ── Phase 1 security regression tests ──────────────────────────────────
+
+
+class TestPhase1Security:
+    """Regression tests for the Phase 1 critical-attack-chain fixes.
+
+    Covers:
+      S1: Content-Type: application/json required (forces CORS preflight)
+      S2: base_url on /api/task body must match the configured URL
+      S5: CORSMiddleware only allows chrome-extension://* and 127.0.0.1
+      S7: /api/task is fail-closed (tested above in TestTaskWithOverrides)
+    """
+
+    def test_task_rejects_non_json_content_type(self, client, authed_env):
+        """S1: a POST with text/plain Content-Type must be rejected (415).
+        This is the historical CSRF primitive: a malicious page submits
+        a form with enctype=text/plain and the server would parse it as
+        JSON. With this check, the server refuses the body before parsing.
+        """
+        r = client.post(
+            "/api/task",
+            content=b'{"task": "x"}',
+            headers={
+                "content-type": "text/plain",
+                "X-Auth-Token": "secret-token",
+            },
+        )
+        assert r.status_code == 415
+        assert "application/json" in r.json()["detail"]
+
+    def test_task_accepts_application_json_charset(self, client, authed_env):
+        """S1: `Content-Type: application/json; charset=utf-8` must be
+        accepted — the parameter is allowed by RFC 9110 and the existing
+        clients send it that way."""
+        r = client.post(
+            "/api/task",
+            content=b'{"task": "x"}',
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "X-Auth-Token": "secret-token",
+            },
+        )
+        # 401/403 indicates auth, 400 indicates missing task — anything
+        # except 415 is fine.
+        assert r.status_code != 415
+
+    def test_task_rejects_body_base_url_mismatch(self, client, authed_configured_env):
+        """S2: if the body supplies a base_url, it must normalize-match
+        the configured LLM_BASE_URL. This is the SSRF guard on /api/task
+        (which previously forwarded the URL to the adapter with no check)."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "base_url": "https://evil.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "base_url" in r.json()["error"]
+
+    def test_task_rejects_body_base_url_lookalike(self, client, authed_configured_env):
+        """S2: a hostname that contains the configured hostname as a
+        suffix (api.openai.com.evil.com) must be rejected."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "base_url": "https://api.openai.com.evil.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "base_url" in r.json()["error"]
+
+    def test_task_accepts_body_base_url_when_match(self, client, authed_configured_env):
+        """S2: when the body's base_url exactly matches the configured
+        LLM_BASE_URL, the request proceeds past the SSRF guard."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "base_url": "https://api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        # 200 would mean a real run; 4xx other than 400 (base_url) is OK.
+        # The point is: NOT 400 with 'base_url' in the error.
+        if r.status_code == 400:
+            assert "base_url" not in r.json().get("error", "")
+
+    def test_task_rejects_base_url_when_unconfigured(self, client, authed_env):
+        """S2: when LLM_BASE_URL is unset, no body base_url is allowed."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "base_url": "https://api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "base_url" in r.json()["error"]
+
+    def test_cors_allows_chrome_extension_origin(self, client, authed_env):
+        """S5: a request with Origin: chrome-extension://<32-char-id> must
+        receive the matching Access-Control-Allow-Origin response header
+        (so the extension can call the API)."""
+        ext_id = "a" * 32  # 32-char Chrome extension ID
+        r = client.get(
+            "/api/config",
+            headers={"Origin": f"chrome-extension://{ext_id}"},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == f"chrome-extension://{ext_id}"
+
+    def test_cors_allows_local_ui_origin(self, client, env_backup):
+        """S5: the local web UI at http://127.0.0.1:8000 must be allowed."""
+        r = client.get(
+            "/api/config",
+            headers={"Origin": "http://127.0.0.1:8000"},
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1:8000"
+
+    def test_cors_blocks_other_origins(self, client, env_backup):
+        """S5: a cross-origin request from a random website must NOT
+        receive an Access-Control-Allow-Origin header. The browser will
+        then block the response, so the malicious page can't read it."""
+        r = client.get(
+            "/api/config",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        # CORS blocks the JS from reading the response — no ACAO header.
+        assert "access-control-allow-origin" not in {k.lower() for k in r.headers}
 
 
 class TestKeychainEndpoints:
@@ -584,10 +718,11 @@ class TestSemaphoreAndConcurrency:
         # Default max_concurrent_tasks is 3.
         assert server._task_semaphore._value == 3  # type: ignore[attr-defined]
 
-    def test_semaphore_released_when_adapter_fails(self, client, env_backup):
+    def test_semaphore_released_when_adapter_fails(self, client, authed_env):
         """If get_adapter() raises (e.g. unknown provider), the semaphore
         must be released — otherwise a single bad request would leak a
-        slot forever."""
+        slot forever. S7: with auth configured, send X-Auth-Token so
+        the request reaches the adapter-failure branch."""
         from browser_agent.ui import server
 
         sem_before = server._task_semaphore._value  # type: ignore[attr-defined]
@@ -595,6 +730,7 @@ class TestSemaphoreAndConcurrency:
         r = client.post(
             "/api/task",
             json={"task": "do something", "provider": "nope"},
+            headers={"X-Auth-Token": "secret-token"},
         )
         assert r.status_code == 400
         assert "Unknown provider" in r.json()["error"]
@@ -788,12 +924,16 @@ class TestMalformedJsonBody:
         )
         assert r.status_code == 400
 
-    def test_json_body_must_be_object(self, client, env_backup):
-        """A bare list is valid JSON but isn't a request body shape."""
+    def test_json_body_must_be_object(self, client, authed_env):
+        """A bare list is valid JSON but isn't a request body shape.
+        S7: /api/task now requires auth first, so send the token."""
         r = client.post(
             "/api/task",
             content=b"[1, 2, 3]",
-            headers={"content-type": "application/json"},
+            headers={
+                "content-type": "application/json",
+                "X-Auth-Token": "secret-token",
+            },
         )
         assert r.status_code == 400
         assert "object" in r.json()["detail"].lower()
@@ -903,7 +1043,7 @@ class TestLazyGlobalInit:
     cleanup."""
 
     def test_create_task_initializes_semaphore_lazily(
-        self, client, env_backup, caplog
+        self, client, authed_env, caplog
     ):
         import logging
 
@@ -911,10 +1051,15 @@ class TestLazyGlobalInit:
 
         # Simulate a lifespan-less run by clearing the semaphore
         # AFTER the lifespan ran (the autouse _reset_server_globals
-        # fixture also runs after).
+        # fixture also runs after). S7: with auth configured, send
+        # X-Auth-Token so the request reaches the lazy-init branch.
         server._task_semaphore = None
         with caplog.at_level(logging.WARNING, logger="browser_agent.ui.server"):
-            r = client.post("/api/task", json={"task": "test"})
+            r = client.post(
+                "/api/task",
+                json={"task": "test"},
+                headers={"X-Auth-Token": "secret-token"},
+            )
         # Unknown provider, but the request reached the endpoint.
         assert r.status_code in (400, 200)
         # The semaphore was re-initialized and the warning was logged.

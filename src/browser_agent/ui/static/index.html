@@ -174,6 +174,16 @@
     <button id="send-btn" onclick="sendTask()">Send</button>
   </div>
 
+  <details id="settings">
+    <summary>Settings</summary>
+    <label>
+      <span>Auth token (BROWSER_AGENT_API_TOKEN from <code>.env</code>):</span>
+      <input type="password" id="auth-token-input" autocomplete="off" spellcheck="false"/>
+      <button type="button" id="auth-token-save">Save</button>
+      <small>Stored in this browser only. Required after S7 hardening (server is fail-closed).</small>
+    </label>
+  </details>
+
   <!-- gate modal -->
   <div id="gate-overlay" class="overlay">
     <div class="modal">
@@ -196,6 +206,30 @@
     let currentGateId = null;
     let taskRunning = false; // re-entrancy guard for sendTask
 
+    // S7: send X-Auth-Token with every fetch. The token is collected from
+    // the user via the Settings panel and persisted in localStorage. We do
+    // NOT ship a default token — the user must paste it from .env.
+    const authTokenInput = document.getElementById('auth-token-input');
+    const authTokenSave = document.getElementById('auth-token-save');
+    const AUTH_TOKEN_KEY = 'browser-agent.auth-token';
+    function getAuthToken() { return localStorage.getItem(AUTH_TOKEN_KEY) || ''; }
+    authTokenInput.value = getAuthToken();
+    authTokenSave.addEventListener('click', () => {
+      const v = authTokenInput.value.trim();
+      if (v) localStorage.setItem(AUTH_TOKEN_KEY, v);
+      else localStorage.removeItem(AUTH_TOKEN_KEY);
+      authTokenSave.textContent = 'Saved';
+      setTimeout(() => { authTokenSave.textContent = 'Save'; }, 1200);
+    });
+
+    function authHeaders(extra) {
+      const t = getAuthToken();
+      const h = Object.assign({}, extra || {});
+      h['Content-Type'] = 'application/json';
+      if (t) h['X-Auth-Token'] = t;
+      return h;
+    }
+
     function appendMsg(cls, html) {
       const div = document.createElement('div');
       div.className = 'msg ' + cls;
@@ -217,7 +251,7 @@
 
       fetch('/api/task', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ task })
       })
       .then(r => r.json())
