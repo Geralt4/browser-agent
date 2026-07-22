@@ -7,12 +7,18 @@ protocol = 4-byte little-endian length prefix + UTF-8 JSON), and this script
 executes the command against the keyring library (macOS Keychain / Windows
 Credential Manager / Linux Secret Service) and writes the response to stdout.
 
+Additionally, on the first ``ping`` from the extension, the host checks
+whether the local API server (``browser-agent-ui``) is running on
+127.0.0.1:8000. If not, it spawns it as a background subprocess so the
+extension's HTTP API calls work without manual server startup. This makes
+"Load unpacked" in Chrome work with zero terminal commands.
+
 Commands:
+    {"cmd": "ping"}
     {"cmd": "set_key",    "service": str, "key": str, "value": str}
     {"cmd": "get_key",    "service": str, "key": str}
     {"cmd": "delete_key", "service": str, "key": str}
     {"cmd": "list_keys",  "service": str}
-    {"cmd": "ping"}
 
 Responses:
     {"ok": true,  ...}    on success
@@ -27,7 +33,11 @@ from __future__ import annotations
 import json
 import re
 import struct
+import subprocess
 import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
 
 # Chrome's native messaging limit. A hostile extension could otherwise send
 # a length prefix of 0xFFFFFFFF and cause a 4 GB allocation attempt.
@@ -38,6 +48,57 @@ MAX_MESSAGE_SIZE = 1024 * 1024
 # into the OS keychain. Mirrors the server-side validation in server.py.
 _ALLOWED_SERVICES = frozenset({"browser-agent", "browser-agent-test"})
 _KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+API_SERVER_URL = "http://127.0.0.1:8000"
+# Repo root = 3 levels up from extension/native_host/ -> repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SERVER_STARTED = False
+
+
+def _ensure_server() -> None:
+    """Check if the API server is running; spawn it if not.
+
+    Called once on the first ``ping`` from the extension. After the
+    initial spawn, ``SERVER_STARTED`` is set to ``True`` to avoid
+    re-checking on every ping.
+    """
+    global SERVER_STARTED
+    if SERVER_STARTED:
+        return
+
+    # Check whether 127.0.0.1:8000 already responds.
+    req = urllib.request.Request(f"{API_SERVER_URL}/api/keychain/ping", method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=2.0)
+        SERVER_STARTED = True
+        return
+    except Exception:
+        pass
+
+    # Server is not running — spawn it as a background subprocess.
+    try:
+        subprocess.Popen(
+            ["uv", "run", "browser-agent-ui"],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        # ``uv`` not in PATH — try ``sys.executable -m`` as a fallback.
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "browser_agent.ui.server"],
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            # Both attempts failed; the user will need to start the server
+            # manually. The side panel's error message tells them how.
+            pass
+    SERVER_STARTED = True
 
 
 def _validate_keychain_params(service: str, key: str) -> str | None:
@@ -102,6 +163,7 @@ def main() -> int:
             _id = msg.get("_id")
             try:
                 if cmd == "ping":
+                    _ensure_server()
                     send({"ok": True, "pong": True, "_id": _id})
                 elif cmd == "set_key":
                     service = msg.get("service", "")

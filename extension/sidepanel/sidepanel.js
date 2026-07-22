@@ -49,12 +49,39 @@ document.addEventListener("keydown", (e) => {
 
 let keychainAvailable = null; // null = unchecked, true/false after ping
 
+// ---------------- server connectivity helpers ----------------
+function isServerConnectionError(e) {
+  return e instanceof TypeError && (
+    e.message === "Failed to fetch" ||
+    e.message.startsWith("NetworkError") ||
+    e.message.startsWith("net::ERR_")
+  );
+}
+
+function serverNotRunningMessage() {
+  return (
+    "Cannot reach the browser-agent server at " + esc(API_BASE) + ". " +
+    "Make sure it is running.<br><br>" +
+    "Run <code>./install.sh</code> in the project directory to set up the " +
+    "server as a background service. Or start it manually with:<br><br>" +
+    "<code>uv run browser-agent-ui</code>"
+  );
+}
+
 async function keychainCall(cmd, payload) {
-  const r = await fetch(`${API_BASE}/api/keychain/${cmd}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload || {}),
-  });
+  let r;
+  try {
+    r = await fetch(`${API_BASE}/api/keychain/${cmd}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+  } catch (e) {
+    if (isServerConnectionError(e)) {
+      throw new Error(serverNotRunningMessage());
+    }
+    throw e;
+  }
   if (!r.ok) {
     const data = await r.json().catch(() => ({}));
     throw new Error((data && data.error) || `HTTP ${r.status}`);
@@ -244,7 +271,11 @@ $("fetch-models").addEventListener("click", async () => {
     populateModels(data.models || [], s.model);
     setStatus("models-status", `Loaded ${(data.models || []).length} models.`, "ok");
   } catch (e) {
-    setStatus("models-status", `Failed: ${e.message}`, "error");
+    if (isServerConnectionError(e)) {
+      setStatus("models-status", serverNotRunningMessage(), "error");
+    } else {
+      setStatus("models-status", "Failed: " + e.message, "error");
+    }
   } finally {
     $("fetch-models").disabled = false;
   }
@@ -360,7 +391,11 @@ async function sendTask() {
     currentTaskId = data.task_id;
     openStream();
   } catch (e) {
-    appendMsg("msg--error", `Failed: ${esc(e.message)}`);
+    if (isServerConnectionError(e)) {
+      appendMsg("msg--error", serverNotRunningMessage());
+    } else {
+      appendMsg("msg--error", "Failed: " + esc(e.message));
+    }
     resetChatUI();
   }
 }
