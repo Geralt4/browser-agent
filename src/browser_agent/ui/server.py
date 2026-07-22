@@ -44,19 +44,29 @@ _TOKEN_TTL_S = 1.0
 _token_cache: tuple[float, str | None] | None = None
 
 
+def _sanitize_error(exc: Exception) -> str:
+    """S19: return a generic error string for client-facing responses.
+
+    Internal exception messages may contain file paths, stack details,
+    or other sensitive context. We log the full exception server-side
+    (via log.exception) but return a sanitized message to the client.
+    """
+    return "An internal error occurred"
+
+
 async def _read_json_body(request: Request) -> dict[str, Any]:
-    """FastAPI dependency: parse JSON body or return 400 on decode error.
+    """FastAPI dependency: parse a JSON object body, or return 4xx on errors.
 
-    Wraps `request.json()` so endpoints consistently turn a malformed
-    body into a 400 with a useful error message instead of a 500 from
-    an unhandled `json.JSONDecodeError`. Returns an empty dict when the
-    body is empty (FastAPI's `json()` raises on empty input).
+    Reads the raw body via `request.body()` and decodes it as JSON, so we
+    can validate the Content-Type header (which S1 uses to force a CORS
+    preflight) before doing any parsing. Returns an empty dict when the
+    body is empty so endpoints can treat absent-fields as defaults.
 
-    S1 (CSRF hardening): require `Content-Type: application/json`. This
-    forces browsers to send a CORS preflight for any cross-origin
-    request, and the CORSMiddleware will reject the preflight. Simple
-    cross-origin POSTs with `text/plain` (the historical CSRF vector)
-    are now blocked at the server.
+    Failure modes:
+    - Wrong/missing Content-Type  -> 415 (S1: forces CORS preflight)
+    - Empty body                  -> {} (caller treats as no fields)
+    - Malformed JSON              -> 400 with line/column of the error
+    - JSON value is not an object -> 400 (bare lists/scalars are rejected)
     """
     content_type = request.headers.get("content-type", "")
     if not content_type.split(";")[0].strip().lower() == "application/json":
@@ -225,6 +235,38 @@ _CONFIG_KEYS: dict[str, str] = {
 }
 
 
+def _validate_base_url_write(value: str) -> str:
+    """S11: validate a LLM_BASE_URL value before persisting it.
+
+    Rejects values that aren't well-formed URLs (no scheme, no hostname)
+    or that look like URL-credential attacks (userinfo@host). This
+    prevents config poisoning where an attacker tricks the user into
+    saving a URL that bypasses the SSRF guard on /api/task (e.g.
+    ``https://api.openai.com@evil.com``).
+    """
+    from urllib.parse import urlparse
+
+    if not value or not value.strip():
+        return value  # empty = clear; no validation needed
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail="LLM_BASE_URL must use http or https scheme",
+        )
+    if not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail="LLM_BASE_URL must have a valid hostname",
+        )
+    if parsed.username or parsed.password:
+        raise HTTPException(
+            status_code=400,
+            detail="LLM_BASE_URL must not contain userinfo (user:password@host)",
+        )
+    return value
+
+
 @app.post("/api/config", dependencies=[Depends(_require_auth)])
 async def update_config(
     request: Request,
@@ -266,6 +308,10 @@ async def update_config(
             elif env_key in body:
                 value = body[env_key]
                 existing[env_key] = "" if value is None else str(value)
+        # S11: validate LLM_BASE_URL before persisting to prevent config
+        # poisoning that would bypass the SSRF guard on /api/task.
+        if "LLM_BASE_URL" in existing and existing["LLM_BASE_URL"]:
+            _validate_base_url_write(existing["LLM_BASE_URL"])
         _write_env(env_path, existing)
     return {"status": "ok"}
 
@@ -300,10 +346,13 @@ async def list_models(request: Request, base_url: str = ""):
     else:
         target = configured_url
 
-    api_key = request.headers.get("X-API-Key", "")
+    # S8/S9: same resolution order as /api/task — X-API-Key header first,
+    # then the OS keychain. Curl/scripts that don't have keychain access
+    # still work via the header.
+    api_key = request.headers.get("X-API-Key", "") or _read_keychain_api_key() or ""
     if not api_key:
         return JSONResponse(
-            content={"error": "X-API-Key header is required"},
+            content={"error": "X-API-Key header or keychain entry required"},
             status_code=400,
         )
     try:
@@ -336,41 +385,7 @@ def _require_auth_optional(request: Request) -> None:
         raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
 
 
-def _require_auth_strict(request: Request) -> None:
-    """FastAPI dependency: ALWAYS require a valid X-Auth-Token (S7).
-
-    S7 fix: the previous `/api/task` endpoint used _require_auth_optional,
-    which silently allowed every request when BROWSER_AGENT_API_TOKEN was
-    unset. That made an unconfigured server trivially exploitable by any
-    browser visiting a malicious site (the malicious site would simply
-    POST to the local API — same as the CSRF chain described in S1/S5).
-
-    Strict semantics:
-    - No token configured  -> 403 (endpoint disabled, fail-closed)
-    - Header missing       -> 401
-    - Token mismatch       -> 401
-    - Match                -> None (request proceeds)
-
-    The extension stores the token and adds `X-Auth-Token` to every
-    request. The web UI (index.html) will be updated in a follow-up to
-    read the token from localStorage and include it in fetch() calls.
-    CLI usage is unaffected — `browser-agent` calls run_task_streaming
-    in-process, never via HTTP.
-    """
-    expected = _configured_token()
-    if not expected:
-        raise HTTPException(
-            status_code=403,
-            detail="endpoint disabled: set BROWSER_AGENT_API_TOKEN in .env",
-        )
-    provided = request.headers.get("X-Auth-Token", "")
-    if not provided:
-        raise HTTPException(status_code=401, detail="X-Auth-Token header required")
-    if not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="invalid X-Auth-Token")
-
-
-@app.post("/api/task", dependencies=[Depends(_require_auth_strict)])
+@app.post("/api/task", dependencies=[Depends(_require_auth)])
 async def create_task(
     request: Request,
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
@@ -419,14 +434,22 @@ async def create_task(
     requested_base_url = body.get("base_url")
     if requested_base_url is not None and requested_base_url != "":
         if not is_allowed_base_url(str(requested_base_url), cfg.llm_base_url):
+            if sem is not None:
+                sem.release()  # release the slot we acquired above
             return JSONResponse(
                 content={"error": "base_url not allowed by server policy"},
                 status_code=400,
             )
 
-    # API key is passed via the X-API-Key header (not the request body)
-    # to avoid logging it in body-level middleware/crash dumps.
-    api_key = request.headers.get("X-API-Key")
+    # API key resolution order (S8/S9):
+    #   1. X-API-Key header (explicit, used by curl/scripts/tests)
+    #   2. OS keychain (preferred for the browser extension — never crosses
+    #      the HTTP boundary, never stored in chrome.storage.local)
+    #   3. .env's LLM_API_KEY / MOONSHOT_API_KEY (loaded into cfg by
+    #      load_config() — preserved as a final fallback)
+    header_key = request.headers.get("X-API-Key")
+    keychain_key = header_key if header_key else _read_keychain_api_key()
+    api_key = keychain_key
     overrides = {
         "llm_model": body.get("model"),
         "llm_base_url": body.get("base_url"),
@@ -436,7 +459,15 @@ async def create_task(
         "provider": body.get("provider"),
         "cdp_url": body.get("cdp_url"),
     }
-    cfg = cfg.with_overrides(**overrides)
+    try:
+        cfg = cfg.with_overrides(**overrides)
+    except Exception as exc:
+        # Pydantic validators on cdp_url (S13) raise ValidationError when
+        # the user submits a non-loopback URL. Surface a clean 400 instead
+        # of a 500.
+        if sem is not None:
+            sem.release()
+        return JSONResponse(content={"error": str(exc)}, status_code=400)
 
     try:
         adapter = get_adapter(cfg)
@@ -477,7 +508,10 @@ async def create_task(
         except Exception as exc:
             log.exception("Task %s failed", task_id)
             try:
-                await queue.put({"type": "error", "message": str(exc)})
+                # S19: log the full exception server-side, but send a
+                # sanitized message to the client — internal exception
+                # text may contain file paths or other sensitive context.
+                await queue.put({"type": "error", "message": _sanitize_error(exc)})
             except Exception:
                 pass
         finally:
@@ -534,7 +568,10 @@ async def stream_task(task_id: str):
     return EventSourceResponse(generator())
 
 
-@app.post("/api/gate/approve")
+@app.post(
+    "/api/gate/approve",
+    dependencies=[Depends(_require_auth_optional)],
+)
 async def gate_approve(
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
 ):
@@ -547,7 +584,10 @@ async def gate_approve(
     return JSONResponse(content={"status": "not found"}, status_code=404)
 
 
-@app.post("/api/gate/deny")
+@app.post(
+    "/api/gate/deny",
+    dependencies=[Depends(_require_auth_optional)],
+)
 async def gate_deny(
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
 ):
@@ -595,13 +635,91 @@ def _validate_keychain_params(service: str, key: str) -> None:
 
 
 def _keychain_error_response(exc: Exception) -> JSONResponse:
+    # S19: log the full exception server-side, but return a generic
+    # message to the client — the raw exception type/message may reveal
+    # internal state (e.g. "PasswordDeleteError: no such password" tells
+    # an attacker whether a keychain entry exists).
+    log.debug("keychain error: %s", exc, exc_info=True)
     return JSONResponse(
-        content={"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+        content={"ok": False, "error": "keychain operation failed"},
         status_code=500,
     )
 
 
-@app.post("/api/keychain/ping")
+def _check_origin_allowed(request: Request) -> None:
+    """Defense-in-depth Origin check for unauthenticated keychain endpoints.
+
+    S4: the keychain endpoints are intentionally unauthenticated (the
+    extension has no way to obtain BROWSER_AGENT_API_TOKEN — that would
+    force the API key into plaintext chrome.storage.local). CORS already
+    blocks cross-origin browser requests, but if a misconfiguration ever
+    weakened the CORSMiddleware allowlist, this explicit check would
+    still refuse any non-allowed origin.
+
+    Allowed origins:
+    - `chrome-extension://<id>` — the browser extension (any ID, since
+      unpacked extensions get a per-install UUID)
+    - `http://127.0.0.1:8000` — the local web UI
+    - No `Origin` header at all — server-to-server calls (curl, scripts)
+
+    This is best-effort, not cryptographic: a malicious browser extension
+    can trivially forge any Origin. The check protects against CSRF from
+    a malicious website, which is the realistic threat model.
+    """
+    import re
+
+    origin = request.headers.get("origin", "")
+    if not origin:
+        return  # server-to-server; no browser context
+    if origin == "http://127.0.0.1:8000":
+        return
+    if re.match(r"^chrome-extension://[a-z]{32}$", origin):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="origin not allowed",
+    )
+
+
+# S22: simple in-memory rate limiter for unauthenticated keychain endpoints.
+# A local malicious process (or a compromised browser extension) could spam
+# these endpoints to enumerate keychain entries or exhaust the OS secret
+# store. The limiter caps each client IP to _KEYCHAIN_RATE_LIMIT_MAX calls
+# per _KEYCHAIN_RATE_LIMIT_WINDOW seconds.
+_KEYCHAIN_RATE_LIMIT_MAX = 10
+_KEYCHAIN_RATE_LIMIT_WINDOW = 10.0  # seconds
+_keychain_rate_buckets: dict[str, list[float]] = {}
+
+
+def _rate_limit_keychain(request: Request) -> None:
+    """FastAPI dependency: enforce a per-IP rate limit on keychain endpoints.
+
+    Uses a sliding-window counter. When the limit is exceeded, returns 429.
+    The bucket dict is lazily pruned of expired entries on each call to
+    avoid unbounded growth.
+    """
+    import time
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - _KEYCHAIN_RATE_LIMIT_WINDOW
+    bucket = _keychain_rate_buckets.get(client_ip, [])
+    # Prune entries outside the window.
+    bucket = [t for t in bucket if t > cutoff]
+    if len(bucket) >= _KEYCHAIN_RATE_LIMIT_MAX:
+        _keychain_rate_buckets[client_ip] = bucket
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded — try again later",
+        )
+    bucket.append(now)
+    _keychain_rate_buckets[client_ip] = bucket
+
+
+@app.post(
+    "/api/keychain/ping",
+    dependencies=[Depends(_check_origin_allowed), Depends(_rate_limit_keychain)],
+)
 async def keychain_ping():
     """Health check for the keychain bridge. Returns the same shape as the
     native host's ping so the side panel can use it as a drop-in probe."""
@@ -616,7 +734,10 @@ async def keychain_ping():
     return {"ok": True, "pong": True}
 
 
-@app.post("/api/keychain/set")
+@app.post(
+    "/api/keychain/set",
+    dependencies=[Depends(_check_origin_allowed), Depends(_rate_limit_keychain)],
+)
 async def keychain_set(
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
 ):
@@ -632,7 +753,10 @@ async def keychain_set(
     return {"ok": True}
 
 
-@app.post("/api/keychain/get")
+@app.post(
+    "/api/keychain/get",
+    dependencies=[Depends(_check_origin_allowed), Depends(_rate_limit_keychain)],
+)
 async def keychain_get(
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
 ):
@@ -647,7 +771,10 @@ async def keychain_get(
     return {"ok": True, "value": value}
 
 
-@app.post("/api/keychain/delete")
+@app.post(
+    "/api/keychain/delete",
+    dependencies=[Depends(_check_origin_allowed), Depends(_rate_limit_keychain)],
+)
 async def keychain_delete(
     body: dict[str, Any] = Depends(_read_json_body),  # noqa: B008
 ):
@@ -679,6 +806,25 @@ def _env_path() -> pathlib.Path:
     return pathlib.Path.cwd() / ".env"
 
 
+def _read_keychain_api_key() -> str | None:
+    """Read the LLM API key from the OS keychain via the `keyring` lib.
+
+    S8+S9: the extension stores the key in the OS keychain (service
+    `browser-agent`, key `llm_api_key`) rather than chrome.storage.local
+    (plaintext on disk) or the X-API-Key HTTP header (cleartext over the
+    loopback HTTP boundary). The server reads it here, in-process, so the
+    key never crosses the network — even locally. Returns None if the
+    keychain is unreachable, the key is absent, or any exception fires.
+    The caller should fall back to the X-API-Key header in that case so
+    the API still works for non-extension clients (curl, scripts).
+    """
+    try:
+        import keyring
+        return keyring.get_password("browser-agent", "llm_api_key")
+    except Exception:
+        return None
+
+
 def _read_env(path: pathlib.Path) -> dict[str, str]:
     """Read .env using python-dotenv for correct quoting/escaping handling."""
     from dotenv import dotenv_values
@@ -687,10 +833,21 @@ def _read_env(path: pathlib.Path) -> dict[str, str]:
 
 
 def _write_env(path: pathlib.Path, values: dict[str, str]) -> None:
-    """Write .env using python-dotenv for correct quoting/escaping handling."""
+    """Write .env using python-dotenv for correct quoting/escaping handling.
+
+    S10: immediately chmod 0o600 after writing so the file is only
+    readable by the owning user. Without this, the file may inherit
+    the process's umask (commonly 0o022) and be world-readable.
+    """
+    import os
+
     from dotenv import set_key
     for k, v in values.items():
         set_key(str(path), k, v)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # best-effort; non-POSIX platforms may not support chmod
 
 
 async def _cleanup_orphans() -> None:

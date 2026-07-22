@@ -78,3 +78,70 @@ class TestWithOverrides:
         new = cfg.with_overrides()
         assert new.llm_model == "gpt-4o"
         assert new is not cfg
+
+
+class TestCdpUrlValidation:
+    """S13: cdp_url must point to a loopback address only.
+
+    CDP gives the holder full control of the target browser. A non-
+    loopback URL would expose that to anyone on the network, so we
+    refuse everything except localhost / 127.0.0.1 / ::1.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:9222",
+            "http://127.0.0.1:9222",
+            "http://[::1]:9222",
+            "https://localhost:9223",  # https is technically fine
+        ],
+    )
+    def test_loopback_urls_accepted(self, clean_env, url):
+        cfg = Config(cdp_url=url, llm_api_key="sk-test")
+        assert cfg.cdp_url == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://192.168.1.5:9222",     # LAN address
+            "http://10.0.0.1:9222",        # LAN address
+            "http://169.254.169.254:80",   # AWS metadata
+            "http://example.com:9222",     # public hostname
+            "http://evil.local:9222",      # any non-loopback host
+            "ftp://localhost:9222",        # wrong scheme
+            "ws://localhost:9222",         # wrong scheme
+        ],
+    )
+    def test_non_loopback_urls_rejected(self, clean_env, url):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as excinfo:
+            Config(cdp_url=url, llm_api_key="sk-test")
+        # The error message varies: "loopback" for valid scheme + bad host,
+        # "must use http or https" for invalid scheme. Accept either.
+        msg = str(excinfo.value).lower()
+        assert "loopback" in msg or "must use http" in msg
+
+    def test_none_cdp_url_allowed(self, clean_env):
+        """Default (no CDP) must remain valid — most users use the
+        auto-spawned headless browser."""
+        cfg = Config(llm_api_key="sk-test")
+        assert cfg.cdp_url is None
+
+    def test_with_overrides_validates_cdp_url(self, clean_env):
+        """The S13 fix changes with_overrides to use the constructor
+        (not model_copy) so the validator runs on per-request overrides.
+        Regression test: a malicious cdp_url from a request body must
+        be rejected."""
+        from pydantic import ValidationError
+
+        cfg = Config(llm_api_key="sk-test")
+        with pytest.raises(ValidationError) as excinfo:
+            cfg.with_overrides(cdp_url="http://192.168.1.5:9222")
+        assert "loopback" in str(excinfo.value).lower()
+
+    def test_with_overrides_accepts_loopback(self, clean_env):
+        cfg = Config(llm_api_key="sk-test")
+        new = cfg.with_overrides(cdp_url="http://127.0.0.1:9222")
+        assert new.cdp_url == "http://127.0.0.1:9222"

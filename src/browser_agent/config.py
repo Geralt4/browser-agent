@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +10,38 @@ def _csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def _validate_cdp_url(url: str | None) -> str | None:
+    """S13: a cdp_url must point to a loopback address only.
+
+    CDP (Chrome DevTools Protocol) gives the holder full control of the
+    target browser: open any tab, read cookies, execute arbitrary JS in
+    any origin, dump the user's session. If the URL is reachable from
+    outside the machine (e.g. a non-loopback IP, a public hostname), the
+    entire attack surface is exposed. We refuse anything that isn't
+    explicitly a loopback URL.
+
+    Accepted: `http://localhost:*`, `http://127.0.0.1:*`. (HTTPS is also
+    fine in principle, but Chrome's --remote-debugging-port only serves
+    HTTP, so the realistic form is plain http.)
+    """
+    if url is None or url == "":
+        return None
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"cdp_url must use http or https, got {parsed.scheme!r}"
+        )
+    host = (parsed.hostname or "").lower()
+    if host not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError(
+            f"cdp_url must use a loopback host (localhost, 127.0.0.1, or ::1), "
+            f"got {host!r}. CDP gives full browser control — exposing it to "
+            f"non-loopback addresses is a critical security risk."
+        )
+    return url
 
 
 class Config(BaseSettings):
@@ -39,8 +71,15 @@ class Config(BaseSettings):
     # lets the extension see the user's actual tabs (e.g. ask "what do
     # you see on the current page" and the agent reads the user's tab).
     # Typical value: "http://localhost:9222" — Chrome must be started
-    # with --remote-debugging-port=9222 for this to work.
+    # with --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1
+    # for this to work. The address flag is mandatory: without it, Chrome
+    # binds to 0.0.0.0 and the debug port is reachable from the LAN.
     cdp_url: str | None = None
+
+    @field_validator("cdp_url")
+    @classmethod
+    def _check_cdp_url_loopback(cls, v: str | None) -> str | None:
+        return _validate_cdp_url(v)
 
     # Vision routing: "dom" = always DOM-only, "auto" = per-task heuristic,
     # "vision" = always use vision (if model supports it). Default is "vision"
@@ -110,9 +149,14 @@ class Config(BaseSettings):
         without mutating the process-wide .env-loaded config. Only fields
         that are actually present in the override and non-None are applied
         (None values are treated as "don't override").
+
+        Validators run on the merged result so per-request overrides are
+        also checked. Pydantic's `model_copy(update=...)` skips validators
+        by default, so we re-construct via the model constructor instead.
         """
         updates = {k: v for k, v in kwargs.items() if v is not None and k in type(self).model_fields}
-        return self.model_copy(update=updates)
+        merged = {**self.model_dump(), **updates}
+        return type(self)(**merged)
 
 
 def load_config() -> Config:

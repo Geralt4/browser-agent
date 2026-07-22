@@ -17,7 +17,7 @@ let taskRunning = false; // re-entrancy guard for sendTask
 // ---------------- DOM helpers ----------------
 const $ = (id) => document.getElementById(id);
 function esc(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
 }
 
 // ---------------- tabs ----------------
@@ -110,23 +110,27 @@ function _checkStorageError() {
 
 async function loadSettings() {
   return new Promise((resolve) => {
+    // S12: authToken is stored in chrome.storage.local (not sync) because
+    // chrome.storage.sync uploads data to Google's cloud, which would leak
+    // the auth token to Google's servers. We read both stores in parallel
+    // and merge.
     chrome.storage.sync.get(
-      ["provider", "baseUrl", "model", "visionMode", "visionModels", "authToken", "cdpUrl"],
+      ["provider", "baseUrl", "model", "visionMode", "visionModels", "cdpUrl"],
       (sync) => {
         try { _checkStorageError(); } catch (e) { resolve({ provider: "openai", baseUrl: "", model: "", visionMode: "vision", visionModels: "", apiKey: "", usingLocalFallback: false, authToken: "", cdpUrl: "" }); return; }
-        // apiKey is no longer stored in chrome.storage.local (the plaintext
-        // fallback was removed). It's loaded from the OS keychain in init()
-        // via loadApiKey(). usingLocalFallback is always false now.
-        resolve({
-          provider: sync.provider || "openai",
-          baseUrl: sync.baseUrl || "",
-          model: sync.model || "",
-          visionMode: sync.visionMode || "vision",
-          visionModels: sync.visionModels || "",
-          apiKey: "",
-          usingLocalFallback: false,
-          authToken: sync.authToken || "",
-          cdpUrl: sync.cdpUrl || "",
+        chrome.storage.local.get(["authToken"], (local) => {
+          try { _checkStorageError(); } catch (e) { /* ignore local errors */ }
+          resolve({
+            provider: sync.provider || "openai",
+            baseUrl: sync.baseUrl || "",
+            model: sync.model || "",
+            visionMode: sync.visionMode || "vision",
+            visionModels: sync.visionModels || "",
+            apiKey: "",
+            usingLocalFallback: false,
+            authToken: (local && local.authToken) || "",
+            cdpUrl: sync.cdpUrl || "",
+          });
         });
       }
     );
@@ -134,10 +138,9 @@ async function loadSettings() {
 }
 
 async function saveSettings(s) {
-  // `apiKey` and `usingLocalFallback` in chrome.storage.local are owned by
-  // storeApiKey (which writes to the OS keychain via the native host, or
-  // falls back to local storage). Writing them here would clobber the key
-  // storeApiKey just wrote — see Phase 1.5 fix for issue #7.
+  // S12: authToken goes to chrome.storage.local (not sync) — sync uploads
+  // to Google's cloud, leaking the token. Other prefs (provider, model, etc.)
+  // are non-sensitive and can stay on sync for cross-device convenience.
   await new Promise((resolve, reject) =>
     chrome.storage.sync.set(
       {
@@ -146,11 +149,16 @@ async function saveSettings(s) {
         model: s.model,
         visionMode: s.visionMode,
         visionModels: s.visionModels,
-        authToken: s.authToken || "",
         cdpUrl: s.cdpUrl || "",
       },
       () => {
-        try { _checkStorageError(); resolve(); } catch (e) { reject(e); }
+        try { _checkStorageError(); } catch (e) { reject(e); return; }
+        chrome.storage.local.set(
+          { authToken: s.authToken || "" },
+          () => {
+            try { _checkStorageError(); resolve(); } catch (e) { reject(e); }
+          }
+        );
       }
     )
   );
@@ -268,7 +276,11 @@ $("fetch-models").addEventListener("click", async () => {
   try {
     const params = new URLSearchParams({ base_url: s.baseUrl });
     const r = await fetch(`${API_BASE}/api/models?${params}`, {
-      headers: { "X-API-Key": s.apiKey },
+      // S8/S9: we don't send X-API-Key over HTTP anymore. The server
+      // reads the same key from the OS keychain (the bridge we used to
+      // store it) directly. The apiKey here is only checked to gate
+      // the Fetch button (UX), not transmitted.
+      headers: {},
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
@@ -379,7 +391,9 @@ async function sendTask() {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-Key": savedConfig.apiKey,
+        // S8/S9: do NOT send X-API-Key — the server reads it from the
+        // OS keychain. We keep X-Auth-Token (the BROWSER_AGENT_API_TOKEN
+        // for the server itself) since that one is server-side only.
         ...(savedConfig.authToken ? { "X-Auth-Token": savedConfig.authToken } : {}),
       },
       body: JSON.stringify({
@@ -471,7 +485,7 @@ function handleStreamEvent(msg) {
     currentGateId = msg.gate_id;
     let details = '<dt>Action</dt><dd>' + esc(msg.name) + '</dd>';
     if (msg.summary) details += '<dt>Details</dt><dd>' + esc(msg.summary) + '</dd>';
-    for (const k in msg.params) {
+    for (const k of Object.keys(msg.params)) {
       if (k !== "index" && k !== "new_tab") details += '<dt>' + esc(k) + '</dt><dd>' + esc(String(msg.params[k])) + '</dd>';
     }
     $("gate-detail").innerHTML = details;
@@ -505,7 +519,14 @@ async function resolveGate(approved) {
   try {
     const r = await fetch(`${API_BASE}/api/gate/${approved ? "approve" : "deny"}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // S15: gate endpoints are now auth-gated (fail-open when no token
+        // is configured, fail-closed when it is). Send X-Auth-Token the
+        // same way sendTask() does so the side panel's Approve/Deny buttons
+        // work when the user has set BROWSER_AGENT_API_TOKEN.
+        ...(savedConfig.authToken ? { "X-Auth-Token": savedConfig.authToken } : {}),
+      },
       body: JSON.stringify({ gate_id: currentGateId }),
     });
     if (r.status === 404) {

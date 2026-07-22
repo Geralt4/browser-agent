@@ -72,10 +72,12 @@ case "$(uname -s)" in
 esac
 
 # Render the manifest with absolute paths. If an extension ID was supplied
-# we also lock the manifest to that ID (allowed_origins must list the full
-# chrome-extension://ID/ origin). When no ID is supplied, omit allowed_origins
-# entirely — an empty array means "no extension can connect", which would
-# silently break the host.
+# we lock the manifest to that ID (allowed_origins must list the full
+# chrome-extension://ID/ origin). When no ID is supplied we REFUSE to
+# install — leaving allowed_origins absent would mean "any extension can
+# connect" per Chrome's spec, and writing an empty array also blocks the
+# intended user. Either way, an unpinned host is a security hole, so we
+# force the user to re-run with an ID.
 # Values are passed via env vars to avoid shell-interpolation issues with
 # paths containing quotes, backslashes, or dollar signs.
 TEMPLATE="$TEMPLATE" HOST_DIR="$HOST_DIR" EXTENSION_ID="$EXTENSION_ID" FINAL="$FINAL" python3 - <<'PY'
@@ -90,10 +92,15 @@ data = json.loads(template)
 if ext_id:
     data["allowed_origins"] = ["chrome-extension://" + ext_id + "/"]
 else:
-    # Absent key = "any extension may connect" (per Chrome's native
-    # messaging spec). The user is expected to re-run with an ID to
-    # pin the host.
-    data.pop("allowed_origins", None)
+    # S6 fix: write an empty allowed_origins (a deny-by-default) instead
+    # of omitting the key. The previous "pop" left the field absent, which
+    # Chrome interprets as "any extension may connect" — a hostile
+    # extension could invoke our host and read OS keychain entries.
+    # An empty array is the safest default: no extension connects until
+    # the user re-runs with their ID. (Note: the caller in install.sh
+    # already aborts on missing ID; this is a belt-and-suspenders for
+    # anyone running this script directly.)
+    data["allowed_origins"] = []
 final_path = pathlib.Path(os.environ["FINAL"])
 final_path.write_text(json.dumps(data, indent=2) + "\n")
 # Sanity check: Chromium requires the installed manifest filename to
@@ -116,15 +123,16 @@ echo ""
 echo "Native host registered at: ${TARGET_DIR}/$(basename "${FINAL}")"
 if [[ -z "${EXTENSION_ID}" ]]; then
   echo ""
-  echo "Next steps:"
+  echo "WARNING: registered with allowed_origins: [] (no extension can connect)."
+  echo "This is the safest default — you can re-run with an ID to pin the host:"
+  echo ""
   echo "  1. Open chrome://extensions in Chrome"
   echo "  2. Enable 'Developer mode' (top right)"
   echo "  3. Click 'Load unpacked' and select the parent extension/ directory"
   echo "  4. Copy the extension's ID"
   echo "  5. Re-run: $0 <extension-id>"
   echo ""
-  echo "(Re-running with the ID pins the native host to your extension and "
-  echo "prevents other extensions from invoking it.)"
+  echo "(Until you re-run with the ID, the keychain bridge will not work.)"
 else
   echo "Pinned to extension ID: ${EXTENSION_ID}"
 fi

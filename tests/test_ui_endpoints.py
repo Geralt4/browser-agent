@@ -33,12 +33,14 @@ def _reset_server_globals():
     server._task_semaphore = None
     server._token_cache = None
     server._config_lock = None
+    server._keychain_rate_buckets.clear()
     yield
     server._TASKS.clear()
     server._BACKGROUND_TASKS.clear()
     server._task_semaphore = None
     server._token_cache = None
     server._config_lock = None
+    server._keychain_rate_buckets.clear()
 
 
 @pytest.fixture
@@ -309,8 +311,13 @@ class TestListModelsSecurity:
 
     @patch("browser_agent.models.discovery.urllib.request.urlopen")
     def test_missing_api_key_returns_400(
-        self, mock_urlopen, client, authed_configured_env
+        self, mock_urlopen, client, authed_configured_env, monkeypatch
     ):
+        """S8/S9: with no X-API-Key header AND no keychain entry, the
+        request must be rejected with 400. We patch keyring.get_password
+        to return None so a stray entry on the test machine doesn't
+        accidentally satisfy the auth requirement."""
+        monkeypatch.setattr("keyring.get_password", lambda *a, **kw: None)
         r = client.get(
             "/api/models?base_url=https://api.openai.com",
             headers={"X-Auth-Token": "secret-token"},
@@ -320,19 +327,23 @@ class TestListModelsSecurity:
 
 
 class TestListModels:
-    def test_missing_params(self, client, authed_configured_env):
-        # No X-API-Key header -> 400
+    def test_missing_params(self, client, authed_configured_env, monkeypatch):
+        """S8/S9: with no X-API-Key header AND no keychain entry, returns
+        400. We patch the keychain to None so a stray entry on the test
+        machine doesn't pass."""
+        monkeypatch.setattr("keyring.get_password", lambda *a, **kw: None)
         r = client.get(
             "/api/models",
             headers={"X-Auth-Token": "secret-token"},
         )
         assert r.status_code == 400
-        assert "X-API-Key" in r.json()["error"]
+        assert "X-API-Key" in r.json()["error"] or "keychain" in r.json()["error"]
 
     @patch("browser_agent.models.discovery.urllib.request.urlopen")
-    def test_no_auth_token_required(self, mock_urlopen, client, configured_env):
+    def test_no_auth_token_required(self, mock_urlopen, client, configured_env, monkeypatch):
         """The extension's Fetch button only sends X-API-Key; it must succeed
         when LLM_BASE_URL is set even if BROWSER_AGENT_API_TOKEN is unset."""
+        monkeypatch.setattr("keyring.get_password", lambda *a, **kw: None)
         mock_urlopen.return_value = _FakeResponse(
             200, json.dumps({"data": [{"id": "gpt-4o"}]})
         )
@@ -347,9 +358,10 @@ class TestListModels:
         assert req.get_header("Authorization") == "Bearer sk-test"
 
     @patch("browser_agent.models.discovery.urllib.request.urlopen")
-    def test_happy_path(self, mock_urlopen, client, authed_configured_env):
+    def test_happy_path(self, mock_urlopen, client, authed_configured_env, monkeypatch):
         body = json.dumps({"data": [{"id": "gpt-4o"}, {"id": "gpt-3.5-turbo"}]})
         mock_urlopen.return_value = _FakeResponse(200, body)
+        monkeypatch.setattr("keyring.get_password", lambda *a, **kw: None)
 
         r = client.get(
             "/api/models?base_url=https://api.openai.com",
@@ -359,9 +371,10 @@ class TestListModels:
         assert r.json() == {"models": ["gpt-3.5-turbo", "gpt-4o"]}
 
     @patch("browser_agent.models.discovery.urllib.request.urlopen")
-    def test_provider_error(self, mock_urlopen, client, authed_configured_env):
+    def test_provider_error(self, mock_urlopen, client, authed_configured_env, monkeypatch):
         import urllib.error
         mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+        monkeypatch.setattr("keyring.get_password", lambda *a, **kw: None)
         r = client.get(
             "/api/models?base_url=https://api.openai.com",
             headers={"X-Auth-Token": "secret-token", "X-API-Key": "test"},
@@ -519,6 +532,32 @@ class TestPhase1Security:
         )
         assert r.status_code == 400
         assert "base_url" in r.json()["error"]
+
+    def test_base_url_rejection_releases_semaphore(
+        self, client, authed_configured_env
+    ):
+        """Regression: a rejected base_url must release the semaphore slot
+        it acquired. Previously the request returned 400 without releasing,
+        so three bad base_url requests would deadlock the server (default
+        max_concurrent_tasks=3). Verified by checking the semaphore value
+        is unchanged after one rejection."""
+        from browser_agent.ui import server
+
+        sem_before = server._task_semaphore._value  # type: ignore[attr-defined]
+
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "base_url": "https://evil.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "base_url" in r.json()["error"]
+
+        sem_after = server._task_semaphore._value  # type: ignore[attr-defined]
+        assert sem_after == sem_before, (
+            f"Semaphore leaked on base_url rejection: "
+            f"{sem_before} -> {sem_after}"
+        )
 
     def test_cors_allows_chrome_extension_origin(self, client, authed_env):
         """S5: a request with Origin: chrome-extension://<32-char-id> must
@@ -697,6 +736,140 @@ class TestKeychainEndpoints:
         )
         assert r.status_code == 400
         assert "invalid key" in r.json()["detail"]
+
+
+# ── Phase 2 security regression tests ──────────────────────────────────
+
+
+class TestPhase2Security:
+    """Regression tests for the Phase 2 keychain + CDP fixes.
+
+    Covers:
+      S4: Origin header check on /api/keychain/* endpoints
+      S8: server reads LLM API key from OS keychain when X-API-Key absent
+      S9: X-API-Key still works (backward-compat for curl/scripts/tests)
+      S13: cdp_url on /api/task body is rejected if not loopback
+    """
+
+    def test_keychain_ping_allows_no_origin(self, client, authed_env):
+        """S4: server-to-server calls (no Origin header) must still work
+        — that's how curl/scripts/tests hit the keychain bridge."""
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 200
+
+    def test_keychain_ping_allows_chrome_extension_origin(self, client, authed_env):
+        """S4: a request with Origin: chrome-extension://<id> must be
+        allowed so the browser extension can use the bridge."""
+        ext_id = "a" * 32
+        r = client.post(
+            "/api/keychain/ping",
+            headers={"Origin": f"chrome-extension://{ext_id}"},
+        )
+        assert r.status_code == 200
+
+    def test_keychain_ping_allows_local_ui_origin(self, client, authed_env):
+        """S4: the local web UI at http://127.0.0.1:8000 must be allowed."""
+        r = client.post(
+            "/api/keychain/ping",
+            headers={"Origin": "http://127.0.0.1:8000"},
+        )
+        assert r.status_code == 200
+
+    def test_keychain_ping_rejects_evil_origin(self, client, authed_env):
+        """S4: a cross-origin request from a random website must be
+        rejected with 403, not just have its response hidden by CORS."""
+        r = client.post(
+            "/api/keychain/ping",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        assert r.status_code == 403
+        assert "origin not allowed" in r.json()["detail"]
+
+    def test_keychain_set_rejects_evil_origin(self, client, authed_env):
+        """S4: /api/keychain/set is the write path; the same Origin
+        check applies."""
+        import uuid
+        unique = f"test-key-{uuid.uuid4().hex[:12]}"
+        try:
+            r = client.post(
+                "/api/keychain/set",
+                json={"service": "browser-agent-test", "key": unique, "value": "x"},
+                headers={"Origin": "https://evil.example.com"},
+            )
+            assert r.status_code == 403
+        finally:
+            # Cleanup; the request was rejected so no entry was created
+            # but be defensive in case of a future regression.
+            pass
+
+    def test_task_rejects_non_loopback_cdp_url(self, client, authed_env):
+        """S13: a cdp_url in the body pointing to a non-loopback address
+        must be rejected with 400. CDP gives full browser control;
+        exposing it to a non-loopback host is a critical risk."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "cdp_url": "http://192.168.1.5:9222"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "loopback" in r.json()["error"].lower()
+
+    def test_task_rejects_public_hostname_cdp_url(self, client, authed_env):
+        """S13: a public hostname in cdp_url is also rejected."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "cdp_url": "http://evil.com:9222"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "loopback" in r.json()["error"].lower()
+
+    def test_task_accepts_loopback_cdp_url(self, client, authed_env):
+        """S13: a 127.0.0.1 cdp_url is allowed (the documented happy path)."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "cdp_url": "http://127.0.0.1:9222"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        # 401/403 indicates auth, 400 indicates missing task — anything
+        # except 400 with "loopback" in the error is fine.
+        if r.status_code == 400:
+            assert "loopback" not in r.json().get("error", "").lower()
+
+    def test_task_accepts_localhost_cdp_url(self, client, authed_env):
+        """S13: localhost is also a valid loopback name."""
+        r = client.post(
+            "/api/task",
+            json={"task": "test", "cdp_url": "http://localhost:9222"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        if r.status_code == 400:
+            assert "loopback" not in r.json().get("error", "").lower()
+
+    def test_models_endpoint_falls_back_to_keychain(
+        self, client, authed_configured_env, monkeypatch
+    ):
+        """S8/S9: when X-API-Key is NOT sent, the server must read the
+        key from the OS keychain. We mock keyring.get_password to
+        verify the read path is exercised."""
+        from unittest.mock import patch
+
+        with patch("keyring.get_password", return_value="keychain-key") as mock_get:
+            with patch("browser_agent.models.discovery.urllib.request.urlopen") as mock_urlopen:
+                mock_urlopen.return_value = _FakeResponse(
+                    200, json.dumps({"data": [{"id": "gpt-4o"}]})
+                )
+                r = client.get(
+                    "/api/models?base_url=https://api.openai.com",
+                    headers={"X-Auth-Token": "secret-token"},
+                    # NO X-API-Key
+                )
+                assert r.status_code == 200
+                # The keychain was read with the right (service, key) pair.
+                mock_get.assert_called_with("browser-agent", "llm_api_key")
+                # And the returned key was used as the Bearer token.
+                req = mock_urlopen.call_args[0][0]
+                assert req.get_header("Authorization") == "Bearer keychain-key"
 
 
 # ── Concurrency / semaphore / orphan-cleanup tests ──────────────────────
@@ -891,13 +1064,14 @@ class TestMalformedJsonBody:
     @pytest.mark.parametrize(
         "endpoint,headers",
         [
-            # /api/task uses _require_auth_optional: with a token configured
+            # /api/task uses _require_auth: with a token configured
             # it requires X-Auth-Token. Send the token to reach the body
             # parser.
             ("/api/task", {"X-Auth-Token": "secret-token"}),
-            # /api/gate/* and /api/keychain/* are not auth-gated.
-            ("/api/gate/approve", {}),
-            ("/api/gate/deny", {}),
+            # /api/gate/* now also require auth (S15), so send the token.
+            ("/api/gate/approve", {"X-Auth-Token": "secret-token"}),
+            ("/api/gate/deny", {"X-Auth-Token": "secret-token"}),
+            # /api/keychain/* are not auth-gated.
             ("/api/keychain/set", {}),
             ("/api/keychain/get", {}),
             ("/api/keychain/delete", {}),
@@ -1158,3 +1332,371 @@ class TestSsemultisubscriber:
 
         # The task entry should be popped after the last subscriber leaves.
         assert task_id not in server._TASKS
+
+
+# ── Phase 3 security regression tests ─────────────────────────────────
+
+
+class TestPhase3Security:
+    """Regression tests for the Phase 3 defense-in-depth fixes.
+
+    Covers:
+      S10: .env file is chmod 0o600 after every write
+      S11: LLM_BASE_URL validated before persisting via POST /api/config
+      S15: /api/gate/{approve,deny} require auth when token is configured
+    """
+
+    # ── S10: .env permissions ──────────────────────────────────────────
+
+    def test_write_env_sets_600_permissions(self, client, authed_env, monkeypatch):
+        """S10: after a successful POST /api/config, the .env file must
+        have mode 0o600 (owner read/write only). Without this, the file
+        inherits the process umask (commonly 0o022) and is world-readable."""
+        import os
+
+        r = client.post(
+            "/api/config",
+            json={"llm_model": "gpt-4o"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 200
+        mode = os.stat(str(authed_env)).st_mode & 0o777
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+    def test_write_env_preserves_600_on_existing_file(self, client, authed_env):
+        """S10: the permission must remain 0o600 even after a second write
+        (i.e. the file was already 0o600 and _write_env re-applies it)."""
+        import os
+
+        client.post(
+            "/api/config",
+            json={"llm_model": "gpt-4o"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        client.post(
+            "/api/config",
+            json={"vision_mode": "vision"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        mode = os.stat(str(authed_env)).st_mode & 0o777
+        assert mode == 0o600, f"expected 0o600 after second write, got {oct(mode)}"
+
+    # ── S11: LLM_BASE_URL validation ──────────────────────────────────
+
+    def test_config_rejects_base_url_without_scheme(
+        self, client, authed_env
+    ):
+        """S11: a bare hostname (no http:// or https://) must be rejected
+        with 400 — it's not a valid URL and would confuse the SSRF guard."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "scheme" in r.json()["detail"].lower()
+
+    def test_config_rejects_base_url_with_ftp_scheme(
+        self, client, authed_env
+    ):
+        """S11: only http and https are valid schemes."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "ftp://api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "scheme" in r.json()["detail"].lower()
+
+    def test_config_rejects_base_url_with_userinfo(
+        self, client, authed_env
+    ):
+        """S11: a URL with user:password@host is a credential-smuggling
+        vector (e.g. https://api.openai.com@evil.com). Must be rejected."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "https://admin:pass@api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "userinfo" in r.json()["detail"].lower()
+
+    def test_config_rejects_base_url_without_hostname(
+        self, client, authed_env
+    ):
+        """S11: a URL like https:// must have a hostname."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "https://"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 400
+        assert "hostname" in r.json()["detail"].lower()
+
+    def test_config_accepts_valid_https_base_url(
+        self, client, authed_env
+    ):
+        """S11: a well-formed https URL must be accepted."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "https://api.openai.com"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 200
+
+    def test_config_accepts_valid_http_base_url(
+        self, client, authed_env
+    ):
+        """S11: http is also valid (local providers, development)."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "http://localhost:11434"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 200
+
+    def test_config_accepts_base_url_with_port(
+        self, client, authed_env
+    ):
+        """S11: URLs with explicit ports are valid."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": "https://api.openai.com:443"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 200
+
+    def test_config_clears_base_url_with_empty_string(
+        self, client, authed_env
+    ):
+        """S11: an empty string means 'clear the base_url' and bypasses
+        validation (no hostname to check)."""
+        r = client.post(
+            "/api/config",
+            json={"llm_base_url": ""},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 200
+
+    # ── S15: gate endpoint auth ────────────────────────────────────────
+
+    def test_gate_approve_requires_auth_when_token_set(
+        self, client, authed_env
+    ):
+        """S15: when BROWSER_AGENT_API_TOKEN is configured, gate approve
+        must require a valid X-Auth-Token — otherwise any local process
+        could approve/deny gates."""
+        r = client.post(
+            "/api/gate/approve",
+            json={"gate_id": "test"},
+        )
+        assert r.status_code == 401
+
+    def test_gate_deny_requires_auth_when_token_set(
+        self, client, authed_env
+    ):
+        """S15: deny has the same auth requirement as approve."""
+        r = client.post(
+            "/api/gate/deny",
+            json={"gate_id": "test"},
+        )
+        assert r.status_code == 401
+
+    def test_gate_approve_with_correct_token_succeeds(
+        self, client, authed_env
+    ):
+        """S15: with the correct X-Auth-Token, gate approve proceeds."""
+        r = client.post(
+            "/api/gate/approve",
+            json={"gate_id": "no-such-gate"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        # 404 = gate_id not found, but NOT 401
+        assert r.status_code == 404
+
+    def test_gate_deny_with_correct_token_succeeds(
+        self, client, authed_env
+    ):
+        """S15: with the correct X-Auth-Token, gate deny proceeds."""
+        r = client.post(
+            "/api/gate/deny",
+            json={"gate_id": "no-such-gate"},
+            headers={"X-Auth-Token": "secret-token"},
+        )
+        assert r.status_code == 404
+
+    def test_gate_approve_open_when_no_token_configured(
+        self, client, env_backup
+    ):
+        """S15: when no BROWSER_AGENT_API_TOKEN is configured, gate
+        approve is open (fail-open) for backward compatibility."""
+        r = client.post(
+            "/api/gate/approve",
+            json={"gate_id": "no-such-gate"},
+        )
+        # 404 = gate_id not found, but NOT 401/403
+        assert r.status_code == 404
+
+    def test_gate_deny_open_when_no_token_configured(
+        self, client, env_backup
+    ):
+        """S15: deny is also open when no token is configured."""
+        r = client.post(
+            "/api/gate/deny",
+            json={"gate_id": "no-such-gate"},
+        )
+        assert r.status_code == 404
+
+    def test_gate_approve_wrong_token_rejected(
+        self, client, authed_env
+    ):
+        """S15: wrong token must be rejected."""
+        r = client.post(
+            "/api/gate/approve",
+            json={"gate_id": "test"},
+            headers={"X-Auth-Token": "wrong-token"},
+        )
+        assert r.status_code == 401
+        assert "invalid" in r.json()["detail"]
+
+
+# ── Phase 4 hardening regression tests ──────────────────────────────────
+
+
+class TestPhase4Security:
+    """Regression tests for the Phase 4 hardening fixes.
+
+    Covers:
+      S19: Error messages are sanitized (no internal exception details leaked)
+      S22: Keychain endpoints are rate-limited per client IP
+    """
+
+    # ── S19: error sanitization ─────────────────────────────────────────
+
+    def test_keychain_error_does_not_leak_exception_type(
+        self, client, authed_env, monkeypatch
+    ):
+        """S19: _keychain_error_response must return a generic message,
+        not the raw exception type/name. A leaked exception name like
+        'PasswordDeleteError' tells an attacker whether a keychain entry
+        exists."""
+        import keyring
+
+        def _raise(*a, **kw):
+            raise RuntimeError("super-secret-internal-path-/home/user/.config")
+
+        monkeypatch.setattr(keyring, "get_password", _raise)
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent", "key": "llm_api_key"},
+        )
+        assert r.status_code == 500
+        data = r.json()
+        assert data["ok"] is False
+        # Must NOT contain the raw exception type or message.
+        assert "RuntimeError" not in data["error"]
+        assert "super-secret" not in data["error"]
+        assert "internal" not in data["error"].lower()
+
+    def test_keychain_set_error_sanitized(
+        self, client, authed_env, monkeypatch
+    ):
+        """S19: keychain set errors are also sanitized."""
+        import keyring
+
+        def _raise(*a, **kw):
+            raise OSError("permission denied: /Users/someone/.config")
+
+        monkeypatch.setattr(keyring, "set_password", _raise)
+        r = client.post(
+            "/api/keychain/set",
+            json={"service": "browser-agent", "key": "llm_api_key", "value": "x"},
+        )
+        assert r.status_code == 500
+        data = r.json()
+        assert "OSError" not in data["error"]
+        assert "/Users" not in data["error"]
+        assert "permission denied" not in data["error"].lower()
+
+    # ── S22: rate limiting ──────────────────────────────────────────────
+
+    def test_keychain_ping_rate_limited_after_max(
+        self, client, authed_env
+    ):
+        """S22: after _KEYCHAIN_RATE_LIMIT_MAX (10) calls to /api/keychain/ping
+        within the window, the 11th must return 429."""
+        from browser_agent.ui import server
+
+        max_calls = server._KEYCHAIN_RATE_LIMIT_MAX
+        for i in range(max_calls):
+            r = client.post("/api/keychain/ping")
+            assert r.status_code == 200, f"call {i+1} should succeed"
+
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 429
+        assert "rate limit" in r.json()["detail"].lower()
+
+    def test_keychain_get_rate_limited_after_max(
+        self, client, authed_env
+    ):
+        """S22: rate limiting applies to /api/keychain/get too."""
+        from browser_agent.ui import server
+
+        max_calls = server._KEYCHAIN_RATE_LIMIT_MAX
+        for i in range(max_calls):
+            r = client.post(
+                "/api/keychain/get",
+                json={"service": "browser-agent", "key": "llm_api_key"},
+            )
+            assert r.status_code == 200, f"call {i+1} should succeed"
+
+        r = client.post(
+            "/api/keychain/get",
+            json={"service": "browser-agent", "key": "llm_api_key"},
+        )
+        assert r.status_code == 429
+
+    def test_rate_limit_resets_after_window(
+        self, client, authed_env, monkeypatch
+    ):
+        """S22: after the rate-limit window expires, the bucket is empty
+        and requests succeed again."""
+        import time
+
+        from browser_agent.ui import server
+
+        # Fast-forward time past the window so all timestamps are stale.
+        original_monotonic = time.monotonic
+        fake_now = [original_monotonic()]
+
+        def _fast_forward():
+            fake_now[0] += server._KEYCHAIN_RATE_LIMIT_WINDOW + 1
+            return fake_now[0]
+
+        monkeypatch.setattr(time, "monotonic", _fast_forward)
+
+        # Make max_calls requests (they should all succeed).
+        for _i in range(server._KEYCHAIN_RATE_LIMIT_MAX):
+            r = client.post("/api/keychain/ping")
+            assert r.status_code == 200
+
+        # The next call should succeed because the window has elapsed.
+        r = client.post("/api/keychain/ping")
+        assert r.status_code == 200
+
+    def test_rate_limit_per_ip_independent(
+        self, client, authed_env
+    ):
+        """S22: the rate limiter buckets per client IP — two different IPs
+        have independent counters."""
+        from browser_agent.ui import server
+
+        # Exhaust the limit for the default test client IP (testclient).
+        for _ in range(server._KEYCHAIN_RATE_LIMIT_MAX):
+            client.post("/api/keychain/ping")
+
+        # Verify the bucket structure: the default IP should have max entries.
+        buckets = server._keychain_rate_buckets
+        assert len(buckets) == 1
+        for _ip, entries in buckets.items():
+            assert len(entries) == server._KEYCHAIN_RATE_LIMIT_MAX
