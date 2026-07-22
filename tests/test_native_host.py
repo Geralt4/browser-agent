@@ -65,17 +65,32 @@ def _make_unique_key(prefix: str) -> str:
 class TestNativeHost:
     @pytest.fixture(autouse=True)
     def _require_keychain(self):
-        """Skip when keyring isn't available. The native host
-        subprocess calls `keyring` directly — without a backend the
-        host returns 500 and every test fails, masking the real
-        test intent. The `_require_keychain` fixture in
-        test_ui_endpoints.py does the same for the in-process
-        keychain endpoint."""
+        """Skip when keyring isn't usable. The native host subprocess
+        calls `keyring.set_password` / `get_password` directly — on a
+        runner with no keyring backend the host returns an error and
+        every assertion fails, masking the real test intent.
+
+        Some `keyring` backends initialize successfully (return a
+        non-None backend object) but then fail at use time (the
+        "Fail" backend does this). We exercise the keyring with a
+        probe set/get/delete on a throwaway key to catch both cases.
+        The `keyring`-less local dev path still exercises the full
+        happy path.
+        """
         try:
             import keyring
             keyring.get_keyring()
+            probe_key = f"__probe_{uuid.uuid4().hex}__"
+            try:
+                keyring.set_password("browser-agent-test", probe_key, "x")
+                keyring.get_password("browser-agent-test", probe_key)
+            finally:
+                try:
+                    keyring.delete_password("browser-agent-test", probe_key)
+                except Exception:
+                    pass
         except Exception as exc:
-            pytest.skip(f"keyring/keychain unavailable: {exc}")
+            pytest.skip(f"keyring/keychain unusable: {exc}")
 
     def test_ping(self):
         r = _run_host([{"cmd": "ping"}])

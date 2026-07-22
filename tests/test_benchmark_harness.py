@@ -166,7 +166,7 @@ def test_run_one_returns_timeout_row():
     original = bench_mod.run_task_with_model
     bench_mod.run_task_with_model = _fake_run_task_with_model  # type: ignore[assignment]
     try:
-        cfg = Config(llm_api_key="sk-test", llm_model="m", vision_mode="dom")
+        cfg = Config(llm_api_key="sk-test", llm_model="m", vision_mode="dom", provider="openai")
 
         async def _dummy_confirm(action):
             return SafetyDecision(allow=True, reason="ok")
@@ -416,7 +416,7 @@ def test_run_one_repeated_with_repeats_1_returns_run_one_shape():
     original = bench_mod.run_one
     bench_mod.run_one = _fake_run_one  # type: ignore[assignment]
     try:
-        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom")
+        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom", provider="openai")
 
         async def _dummy_confirm(action):
             return SafetyDecision(allow=True, reason="ok")
@@ -452,7 +452,7 @@ def test_run_one_repeated_with_repeats_3_aggregates():
     original = bench_mod.run_one
     bench_mod.run_one = _fake_run_one  # type: ignore[assignment]
     try:
-        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom")
+        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom", provider="openai")
 
         async def _dummy_confirm(action):
             return SafetyDecision(allow=True, reason="ok")
@@ -669,7 +669,7 @@ def test_run_one_populates_dom_excerpt_via_callback():
     original = bench_mod.run_task_with_model
     bench_mod.run_task_with_model = _fake_run_task_with_model  # type: ignore[assignment]
     try:
-        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom")
+        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom", provider="openai")
 
         async def _dummy_confirm(action):
             return SafetyDecision(allow=True, reason="ok")
@@ -707,7 +707,7 @@ def test_run_one_timeout_row_has_empty_dom_excerpt():
     original = bench_mod.run_task_with_model
     bench_mod.run_task_with_model = _fake_run_task_with_model  # type: ignore[assignment]
     try:
-        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom")
+        cfg = Config(llm_api_key="sk", llm_model="m", vision_mode="dom", provider="openai")
 
         async def _dummy_confirm(action):
             return SafetyDecision(allow=True, reason="ok")

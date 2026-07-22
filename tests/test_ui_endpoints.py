@@ -443,10 +443,26 @@ class TestKeychainEndpoints:
         keychain isn't reachable. The first keychain call would otherwise
         500 in the server, masking the real test intent, and on macOS a
         missing keychain triggers a blocking Access prompt that hangs
-        unattended CI."""
+        unattended CI.
+
+        Some backends initialize successfully but fail at use time
+        (the `Fail` backend does this). Exercise the keyring with a
+        probe set/get/delete on a throwaway key to catch both cases.
+        """
+        import uuid
+
         try:
             import keyring
             keyring.get_keyring()
+            probe_key = f"__probe_{uuid.uuid4().hex}__"
+            try:
+                keyring.set_password("browser-agent-test", probe_key, "x")
+                keyring.get_password("browser-agent-test", probe_key)
+            finally:
+                try:
+                    keyring.delete_password("browser-agent-test", probe_key)
+                except Exception:
+                    pass
         except Exception as exc:
             pytest.skip(f"keyring/keychain unavailable: {exc}")
 
