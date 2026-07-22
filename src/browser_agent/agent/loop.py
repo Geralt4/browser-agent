@@ -156,7 +156,7 @@ async def run_task_with_model(
         task=task,
         llm=llm,
         tools=tools,
-        browser_profile=BrowserProfile(headless=cfg.headless),
+        browser_profile=BrowserProfile(**_browser_profile_kwargs(cfg)),
         use_vision=resolve_use_vision(cfg, shim, task, category=category),
         max_actions_per_step=1,
         use_judge=False,
@@ -166,6 +166,20 @@ async def run_task_with_model(
     _wrap_message_manager(agent)
 
     return await agent.run(max_steps=cfg.max_steps)
+
+
+def _browser_profile_kwargs(cfg: Config) -> dict[str, Any]:
+    """Build BrowserProfile kwargs from Config.
+
+    When `cdp_url` is set, connect to an existing browser instance via
+    Chrome DevTools Protocol. browser-use's `cdp_url` parameter takes
+    precedence over `headless` — setting both is harmless but cdp_url
+    wins. This lets the extension user point the agent at their own
+    Chrome session so the agent sees the tabs they're actually viewing.
+    """
+    if cfg.cdp_url:
+        return {"cdp_url": cfg.cdp_url}
+    return {"headless": cfg.headless}
 
 
 async def run_task_streaming(
@@ -219,7 +233,7 @@ async def run_task_streaming(
         task=task,
         llm=adapter.chat_model(),
         tools=tools,
-        browser_profile=BrowserProfile(headless=cfg.headless),
+        browser_profile=BrowserProfile(**_browser_profile_kwargs(cfg)),
         use_vision=resolve_use_vision(cfg, adapter, task),
         max_actions_per_step=1,
         use_judge=False,

@@ -33,6 +33,15 @@ class Config(BaseSettings):
     headless: bool = True
     max_steps: int = 25
 
+    # CDP URL for connecting to an existing browser instance instead of
+    # spawning a new one. When set, headless is ignored — browser-use
+    # attaches to the running Chrome via Chrome DevTools Protocol. This
+    # lets the extension see the user's actual tabs (e.g. ask "what do
+    # you see on the current page" and the agent reads the user's tab).
+    # Typical value: "http://localhost:9222" — Chrome must be started
+    # with --remote-debugging-port=9222 for this to work.
+    cdp_url: str | None = None
+
     # Vision routing: "dom" = always DOM-only, "auto" = per-task heuristic,
     # "vision" = always use vision (if model supports it). Default is "vision"
     # because the 135-task A/B (kimi-k2.6) showed +9.6pp pass rate, -46%

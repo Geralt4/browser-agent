@@ -111,9 +111,9 @@ function _checkStorageError() {
 async function loadSettings() {
   return new Promise((resolve) => {
     chrome.storage.sync.get(
-      ["provider", "baseUrl", "model", "visionMode", "visionModels", "authToken"],
+      ["provider", "baseUrl", "model", "visionMode", "visionModels", "authToken", "cdpUrl"],
       (sync) => {
-        try { _checkStorageError(); } catch (e) { resolve({ provider: "openai", baseUrl: "", model: "", visionMode: "vision", visionModels: "", apiKey: "", usingLocalFallback: false, authToken: "" }); return; }
+        try { _checkStorageError(); } catch (e) { resolve({ provider: "openai", baseUrl: "", model: "", visionMode: "vision", visionModels: "", apiKey: "", usingLocalFallback: false, authToken: "", cdpUrl: "" }); return; }
         // apiKey is no longer stored in chrome.storage.local (the plaintext
         // fallback was removed). It's loaded from the OS keychain in init()
         // via loadApiKey(). usingLocalFallback is always false now.
@@ -126,6 +126,7 @@ async function loadSettings() {
           apiKey: "",
           usingLocalFallback: false,
           authToken: sync.authToken || "",
+          cdpUrl: sync.cdpUrl || "",
         });
       }
     );
@@ -146,6 +147,7 @@ async function saveSettings(s) {
         visionMode: s.visionMode,
         visionModels: s.visionModels,
         authToken: s.authToken || "",
+        cdpUrl: s.cdpUrl || "",
       },
       () => {
         try { _checkStorageError(); resolve(); } catch (e) { reject(e); }
@@ -219,6 +221,7 @@ function fillSettings(s) {
   $("vision-models").value = s.visionModels;
   $("api-key").value = s.apiKey || ""; // pre-fill if stored locally
   $("auth-token").value = s.authToken || "";
+  $("cdp-url").value = s.cdpUrl || "";
   updateVisionNudge();
 }
 
@@ -231,6 +234,7 @@ function readSettings() {
     visionModels: $("vision-models").value.trim(),
     apiKey: $("api-key").value.trim(),
     authToken: $("auth-token").value.trim(),
+    cdpUrl: $("cdp-url").value.trim(),
   };
 }
 
@@ -343,6 +347,7 @@ $("task-input").addEventListener("keydown", (e) => {
 async function sendTask() {
   if (taskRunning) return; // guard against re-entrant calls
   const task = $("task-input").value.trim();
+  $("task-input").value = ""; // clear input immediately so the user can type the next task
   if (!task) return;
   if (!savedConfig || !savedConfig.model) {
     appendMsg("msg--error", "Pick a model in Settings first.");
@@ -384,6 +389,7 @@ async function sendTask() {
         model: savedConfig.model,
         vision_mode: savedConfig.visionMode,
         vision_models: savedConfig.visionModels || null,
+        cdp_url: savedConfig.cdpUrl || null,
       }),
     });
     const data = await r.json();
@@ -441,12 +447,25 @@ function handleStreamEvent(msg) {
   } else if (msg.type === "system") {
     appendMsg("msg--nudge", esc(msg.message));
   } else if (msg.type === "step") {
+    // Step cards: show step N + next goal + action by default. Assessment
+    // and memory (the model's internal reasoning) are collapsed into a
+    // <details> element so they don't dominate the side panel.
     let html = '<div class="step-header"><span class="step-badge">Step ' + esc(msg.step_n) + '</span>';
-    if (msg.next_subgoal) html += '<span class="step-label">Next: ' + esc(msg.next_subgoal) + '</span>';
+    if (msg.next_subgoal) html += '<span class="step-next">Next: ' + esc(msg.next_subgoal) + '</span>';
     html += '</div>';
-    if (msg.assessment) html += '<div class="step-field"><strong>Assessment:</strong> ' + esc(msg.assessment) + '</div>';
-    if (msg.memory)     html += '<div class="step-field"><strong>Memory:</strong> ' + esc(msg.memory) + '</div>';
-    if (msg.action)     html += '<div class="step-field"><strong>Action:</strong> <code>' + esc(msg.action) + '</code></div>';
+    if (msg.action) {
+      html += '<div class="step-action"><span class="step-action-label">ACTION</span><code>' + esc(msg.action) + '</code></div>';
+    }
+    // Collapsible thinking — assessment + memory. The model often writes
+    // long internal reasoning here; hiding it by default keeps the chat
+    // scannable while still letting the user expand it on demand.
+    const hasThinking = (msg.assessment && msg.assessment.trim()) || (msg.memory && msg.memory.trim());
+    if (hasThinking) {
+      html += '<details class="step-thinking"><summary>Thinking</summary><div class="step-thinking-body">';
+      if (msg.assessment) html += '<div><span class="step-thinking-label">Assessment</span><p>' + esc(msg.assessment) + '</p></div>';
+      if (msg.memory)     html += '<div><span class="step-thinking-label">Memory</span><p>' + esc(msg.memory) + '</p></div>';
+      html += '</div></details>';
+    }
     appendMsg("msg--step", html);
   } else if (msg.type === "gate") {
     currentGateId = msg.gate_id;

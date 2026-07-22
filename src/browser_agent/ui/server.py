@@ -345,6 +345,7 @@ async def create_task(
         "vision_mode": body.get("vision_mode"),
         "vision_models": body.get("vision_models"),
         "provider": body.get("provider"),
+        "cdp_url": body.get("cdp_url"),
     }
     cfg = cfg.with_overrides(**overrides)
 

@@ -103,6 +103,19 @@
            you know support vision.</p>
       </div>
 
+      <div class="form-section">
+        <h2>Browser</h2>
+
+        <label for="cdp-url">Connect to my Chrome (CDP URL)</label>
+        <input id="cdp-url" type="text"
+          placeholder="http://localhost:9222">
+        <p class="hint">Leave blank to use the agent's own headless browser. Set to a
+           CDP endpoint (e.g. <code>http://localhost:9222</code>) to make the
+           agent attach to your existing Chrome via the DevTools Protocol.
+           You must start Chrome with
+           <code>--remote-debugging-port=9222</code> for this to work.</p>
+      </div>
+
       <div class="form-section actions">
         <button type="submit" id="save-btn" class="btn btn--primary">Save</button>
         <span id="save-status" class="save-status"></span>

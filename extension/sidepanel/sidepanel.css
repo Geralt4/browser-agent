@@ -101,15 +101,85 @@ main { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 
 .step-header {
   display: flex; gap: 8px; align-items: center; margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 .step-badge {
   background: var(--accent); color: #111;
   font-size: 0.65rem; font-weight: 700;
   padding: 2px 8px; border-radius: 99px;
+  flex-shrink: 0;
+}
+.step-next {
+  color: var(--text); font-size: 0.78rem;
+  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+  word-wrap: break-word;
 }
 .step-label {
   color: var(--muted); font-size: 0.7rem;
   text-transform: uppercase; letter-spacing: 0.5px;
+}
+.step-action {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin: 4px 0;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+.step-action-label {
+  display: block;
+  color: var(--accent);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  margin-bottom: 2px;
+  font-family: var(--font);
+}
+.step-action code {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text);
+}
+.step-thinking {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.step-thinking summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 0;
+  user-select: none;
+}
+.step-thinking summary:hover { color: var(--text); }
+.step-thinking-body {
+  padding: 6px 0 2px 8px;
+  border-left: 2px solid var(--border);
+  margin-top: 4px;
+}
+.step-thinking-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 2px;
+}
+.step-thinking p {
+  margin: 0 0 6px 0;
+  line-height: 1.45;
+  color: var(--text);
+  font-size: 0.75rem;
+  word-wrap: break-word;
 }
 .step-field { margin: 4px 0; }
 .step-field strong { color: var(--muted); font-size: 0.7rem; }
