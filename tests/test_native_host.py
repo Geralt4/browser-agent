@@ -63,6 +63,20 @@ def _make_unique_key(prefix: str) -> str:
 
 
 class TestNativeHost:
+    @pytest.fixture(autouse=True)
+    def _require_keychain(self):
+        """Skip when keyring isn't available. The native host
+        subprocess calls `keyring` directly — without a backend the
+        host returns 500 and every test fails, masking the real
+        test intent. The `_require_keychain` fixture in
+        test_ui_endpoints.py does the same for the in-process
+        keychain endpoint."""
+        try:
+            import keyring
+            keyring.get_keyring()
+        except Exception as exc:
+            pytest.skip(f"keyring/keychain unavailable: {exc}")
+
     def test_ping(self):
         r = _run_host([{"cmd": "ping"}])
         assert r[0] == {"ok": True, "pong": True, "_id": None}
